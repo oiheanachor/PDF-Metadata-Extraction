@@ -124,15 +124,16 @@ def extract_native_pymupdf(pdf_path: Path) -> Optional[RevResult]:
 # ---------------------------------------------------------------------
 # GPT VALIDATION HELPERS
 # ---------------------------------------------------------------------
-# Matches hyphenated numeric REV like 1-0, 2-0, 12-01, etc.
+
+# Pattern to detect hyphenated numeric REVs like 1-0, 2-0, 12-01, etc.
 REV_NUMERIC_PATTERN = re.compile(r"\b\d{1,3}-\d{1,2}\b")
 
 def _normalize_rev_value(raw: Any) -> str:
     """
-    Normalise any raw REV value into consistent forms:
-    - 2.0 -> 2-0
-    - " 2 - 0 " -> "2-0"
-    - "", "NONE", "N/A" -> "NO_REV"
+    Normalise REV values into consistent forms:
+    - 2.0  -> 2-0
+    - ' 2 - 0 ' -> '2-0'
+    - '', 'NONE', 'N/A' -> 'NO_REV'
     """
     if raw is None:
         return ""
@@ -144,13 +145,13 @@ def _normalize_rev_value(raw: Any) -> str:
     if v in {"NO_REV", "EMPTY"}:
         return v
 
-    # Convert 2.0 → 2-0, 3.00 → 3-0, etc.
+    # Convert 2.0 → 2-0, 3.00 → 3-0
     m = re.fullmatch(r"(\d+)\.(\d+)", v)
     if m:
         major, minor = m.groups()
         return f"{int(major)}-{int(minor)}"
 
-    # Remove spaces, e.g. "2 - 0" → "2-0"
+    # Remove spaces e.g. "2 - 0" -> "2-0"
     v = v.replace(" ", "")
     return v
 
@@ -350,12 +351,12 @@ class AzureGPTExtractor:
             pix = page.get_pixmap(matrix=mat, alpha=False, clip=crop)
             png_bytes = pix.tobytes("png")
             return base64.b64encode(png_bytes).decode('utf-8')
-    
-    def extract_rev(self, pdf_path: Path) -> RevResult:
-        """Extract REV using GPT-4 Vision, then validate/salvage with PDF text when possible."""
+
+        def extract_rev(self, pdf_path: Path) -> RevResult:
+        """Extract REV using GPT-4 Vision, with light post-processing of GPT output."""
         try:
             LOG.debug(f"Converting {pdf_path.name} to image...")
-            img_base64 = self.pdf_to_base64_image(pdf_path, page_idx=0, dpi=300)
+            img_base64 = self.pdf_to_base64_image(pdf_path, page_idx=0, dpi=150)
             
             LOG.debug(f"Sending to GPT API...")
             response = self.client.chat.completions.create(
@@ -372,11 +373,11 @@ class AzureGPTExtractor:
                                 "type": "text",
                                 "text": (
                                     "Extract the REV value from this engineering drawing. "
-                                    "Focus on the title block (bottom-right). "
+                                    "Focus on the TITLE BLOCK in the bottom-right. "
                                     "Prioritise hyphenated numeric REVs (like 2-0, 3-0) and "
                                     "avoid grid letters or revision history tables. "
                                     "Return ONLY the JSON object described in the instructions."
-                                ),
+                                )
                             },
                             {
                                 "type": "image_url",
@@ -394,7 +395,7 @@ class AzureGPTExtractor:
             result_text = response.choices[0].message.content or ""
             LOG.debug(f"GPT response received: {result_text[:200]}...")
             
-            # Parse JSON (handle possible ```json ``` fences)
+            # Parse JSON (handle ```json``` fences)
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', result_text, re.DOTALL | re.IGNORECASE)
             if json_match:
                 result_text = json_match.group(1)
@@ -402,17 +403,60 @@ class AzureGPTExtractor:
                 result_text = re.sub(r'```.*?```', '', result_text, flags=re.DOTALL)
             
             result_data = json.loads(result_text.strip())
-            
-            # Validate & possibly correct using PDF text
-            return _validate_gpt_result(pdf_path, result_data)
+
+            # ---------------------------
+            # POST-PROCESSING / FIXUP
+            # ---------------------------
+            raw_value = result_data.get("rev_value", "")
+            notes = (result_data.get("notes") or "").strip()
+            confidence = (result_data.get("confidence") or "unknown").lower()
+
+            # Normalise GPT's raw value (2.0 -> 2-0, etc.)
+            value = _normalize_rev_value(raw_value)
+
+            # If GPT said NO_REV/EMPTY but its notes clearly say there's a single
+            # numeric REV in the TITLE BLOCK, override NO_REV with that numeric value.
+            if value in {"NO_REV", "EMPTY"} and notes:
+                notes_lower = notes.lower()
+                numeric_in_notes = set(REV_NUMERIC_PATTERN.findall(notes))
+
+                # Only override when:
+                #   - exactly one numeric candidate is mentioned
+                #   - notes explicitly mention the title block
+                #   - notes do NOT say the field is blank, no revision, or not applicable
+                if len(numeric_in_notes) == 1 and "title block" in notes_lower:
+                    bad_phrases = re.compile(
+                        r"\b(no\s+rev|no\s+revision|field\s+blank|no\s+value|not\s+applicable)\b",
+                        re.IGNORECASE,
+                    )
+                    if not bad_phrases.search(notes):
+                        candidate = next(iter(numeric_in_notes))
+                        value = candidate
+                        if confidence in {"unknown", "low"}:
+                            confidence = "medium"
+                        # annotate that we overrode NO_REV based on GPT's own notes
+                        notes = (
+                            notes + " | "
+                            if notes
+                            else ""
+                        ) + f"Overrode {raw_value or 'NO_REV'} to {candidate} based on notes"
+
+            # Build final result object
+            return RevResult(
+                file=pdf_path.name,
+                value=value,
+                engine="gpt_vision",
+                confidence=confidence or "unknown",
+                notes=notes,
+            )
             
         except Exception as e:
             LOG.error(f"GPT extraction failed for {pdf_path.name}: {e}")
             return RevResult(
                 file=pdf_path.name,
-                value="NO_REV",
+                value="",
                 engine="gpt_failed",
-                confidence="low",
+                confidence="none",
                 notes=str(e)[:100]
             )
 

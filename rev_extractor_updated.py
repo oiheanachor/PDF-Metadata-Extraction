@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — PyMuPDF + Azure GPT-4 Fallback (OPTIMIZED)
-Fixed to handle: numeric REVs (2-0, 3-0), NO_REV cases, and false positives
+REV Extractor — PyMuPDF + Azure GPT-4 Fallback (FIXED)
+Fixed: GPT now confidently extracts numeric REVs (2-0, 3-0) instead of returning NO_REV
 """
 
 from __future__ import annotations
@@ -21,121 +21,100 @@ try:
 except ImportError:
     AZURE_AVAILABLE = False
 
-LOG = logging.getLogger("rev_extractor_gpt_optimized")
+LOG = logging.getLogger("rev_extractor_gpt_fixed")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# IMPROVED SYSTEM PROMPT - Better handling of numeric REVs
-# IMPROVED SYSTEM PROMPT - strongly discourage guessing
-GPT_SYSTEM_PROMPT = """You are an expert at analyzing engineering drawings and extracting revision (REV) information.
+# FIXED SYSTEM PROMPT - Be confident about numeric REVs
+GPT_SYSTEM_PROMPT = """You are an expert at analyzing engineering drawings and extracting revision information.
 
 YOUR TASK:
-Extract the REV (revision) value from the TITLE BLOCK of this engineering drawing.
+Extract the REV (revision) value from the title block of this engineering drawing.
 
-CRITICAL RULES
+TITLE BLOCK LOCATION:
+- Usually in the BOTTOM-RIGHT corner
+- Contains: DWG NO, SHEET, SCALE, DRAWN BY, CHECKED BY, APPROVED BY, DATE
+- Often includes company name/logo (ROTORK, FAIRCHILD, etc.)
 
-1. TITLE BLOCK ONLY
-- The REV value is in the TITLE BLOCK, usually in the BOTTOM-RIGHT corner.
-- The title block typically contains fields like: DWG NO, SHEET, SCALE, DRAWN BY, CHECKED BY, APPROVED BY, DATE, etc.
-- It often includes the company name or logo (e.g. ROTORK, FAIRCHILD).
+VALID REV FORMATS (ALL EQUALLY COMMON AND VALID):
 
-2. NEVER GUESS
-- You must ONLY copy a REV value that is clearly visible in the image.
-- If the REV text is blurred, cut off, hidden, or you are not 100% sure what it is:
-  → return rev_value = "NO_REV".
-- Do NOT infer a value from patterns or expectations.
-- If the REV field appears blank or you cannot confidently read any value in the REV field:
-  → return rev_value = "NO_REV".
+NUMERIC REVISIONS - THESE ARE STANDARD AND COMMON:
+- Hyphenated numbers: 1-0, 2-0, 3-0, 4-0, 5-1, 12-01, 15-02, etc.
+- Format: [major]-[minor] version (e.g., 2-0 means version 2.0)
+- If you see "REV: 2-0" or "REV: 3-0" → confidently return that value
+- These are NOT drawing numbers (drawing numbers are longer like 055-IPI-057)
+- DO NOT confuse hyphenated REVs with grid coordinates or other numbers
 
-3. VALID REV FORMATS (in order of priority)
-
-NUMERIC REVISIONS (very common)
-- Hyphenated numbers: 1-0, 2-0, 3-0, 12-01, 15-02, etc.
-- These are MAJOR-MINOR versions. Example: 2-0 ≈ "2.0".
-- You MUST copy the digits exactly as shown (2-0 is NOT the same as 3-0).
-
-LETTER REVISIONS (very common)
-- Single letter: A, B, C, D, …, Z
+LETTER REVISIONS - ALSO STANDARD:
+- Single letter: A, B, C, D, E, F, ... Z
 - Double letters: AA, AB, AC, etc.
 
-SPECIAL CASES
-- If there is no REV field at all, OR the field is clearly empty:
-  → rev_value = "NO_REV"
+NO REV - ONLY USE WHEN TRULY ABSENT:
+- Use ONLY if NO REV field exists in the title block
+- Or if the REV field exists but is clearly empty/blank
+- Don't return NO_REV just because the format looks unfamiliar to you
 
-4. THINGS TO IGNORE (COMMON MISTAKES)
-DO NOT return any of the following as the REV value:
-- Any text that is not in or immediately next to the REV field in the TITLE BLOCK.
-- Entries in REVISION HISTORY TABLES (often top-right, columns like: REV | ECO | DATE | DESCRIPTION).
-- Grid letters around the border (A, B, C, 1, 2, 3).
-- Section markers (e.g. "SECTION C-C", "DETAIL A").
-- Part numbers, item callouts, or drawing numbers.
+CRITICAL RULES:
 
-5. VALIDATION CHECKLIST BEFORE ANSWERING
-Before you answer, confirm ALL of these:
-- The value is in or right next to the REV field in the title block.
-- There is a "REV" or "REV:" label nearby.
-- The value matches a valid format (letter or hyphenated number).
-- You are confident you have read it correctly.
+1. NUMERIC REVs (like 2-0, 3-0, 1-0) ARE VALID AND COMMON
+   - If you see a hyphenated number in or near the REV field → return it confidently
+   - Don't second-guess yourself - these are standard revision formats
+   - Example: "DWG NO: 21620 | REV: 2-0" → return "2-0" with high confidence
 
-If ANY of these checks fail, respond with:
-- rev_value = "NO_REV"
-- confidence = "low"
-- notes = "REV field blank, missing, or not readable with certainty"
+2. CHECK TITLE BLOCK ONLY
+   - Ignore revision history tables (usually top-right, with dates and descriptions)
+   - Ignore grid reference letters/numbers on drawing edges
+   - Ignore section markers (SECTION C-C, VIEW A-A)
+   - Ignore drawing numbers (they're longer: 055-IPI-057, not REVs)
 
-RESPONSE FORMAT (IMPORTANT)
-Return ONLY a JSON object, no extra text:
+3. BE CONFIDENT WITH CLEAR VALUES
+   - If you clearly see "REV: 2-0" → return "2-0" (don't return NO_REV!)
+   - If you clearly see "REV: A" → return "A"
+   - Only return NO_REV when the field genuinely doesn't exist or is empty
 
-{
-  "rev_value": "<REV_VALUE_OR_NO_REV_OR_EMPTY>",
-  "confidence": "<high|medium|low>",
-  "location": "short description of where you found (or did not find) the REV",
-  "notes": "very short justification; mention if field was blank, not present, or unreadable"
-}
-
-EXAMPLES
-
-Example 1 – Numeric REV in title block
-- Bottom-right title block shows: "REV: 2-0" next to DWG NO and SHEET fields.
-
-Correct:
+RESPONSE FORMAT:
 {
   "rev_value": "2-0",
   "confidence": "high",
   "location": "bottom-right title block",
-  "notes": "Hyphenated numeric REV 2-0 in title block, ignoring revision history table"
+  "notes": "Clear hyphenated numeric REV 2-0 in title block"
 }
 
-Example 2 – Letter REV
-- Title block shows "REV: E" clearly labeled in the REV field.
+EXAMPLES:
 
-Correct:
-{
-  "rev_value": "E",
-  "confidence": "high",
-  "location": "bottom-right title block",
-  "notes": "Letter REV E in title block"
-}
+Example 1 - Numeric REV (COMMON AND VALID):
+Title block: "DWG NO: 21620 | REV: 2-0 | SHEET 1"
+✅ Correct: {"rev_value": "2-0", "confidence": "high", "notes": "Numeric REV 2-0 in title block"}
+❌ Wrong: {"rev_value": "NO_REV"} ← Don't do this! The value is clearly visible!
 
-Example 3 – NO REV
-- Title block has no REV field at all, or the REV field looks blank.
+Example 2 - Another Numeric REV:
+Title block: "DWG NO: 22416 | REV: 3-0"
+✅ Correct: {"rev_value": "3-0", "confidence": "high"}
+❌ Wrong: {"rev_value": "NO_REV"} ← Wrong! 3-0 is a valid REV!
 
-Correct:
-{
-  "rev_value": "NO_REV",
-  "confidence": "high",
-  "location": "title block",
-  "notes": "No REV field or value present in the title block"
-}
+Example 3 - Numeric REV 1-0:
+Title block: "DWG NO: 12345 | REV: 1-0"
+✅ Correct: {"rev_value": "1-0", "confidence": "high"}
 
-Example 4 – EMPTY / OF
-- Title block shows "REV: OF" or a code clearly meaning "not applicable".
+Example 4 - Letter REV:
+Title block: "DWG NO: 032-IPI-008 | REV: E"
+✅ Correct: {"rev_value": "E", "confidence": "high"}
 
-Correct:
-{
-  "rev_value": "EMPTY",
-  "confidence": "high",
-  "location": "bottom-right title block",
-  "notes": "REV field marked as not applicable (OF)"
-}
+Example 5 - Letter REV:
+Title block: "REV: A | SHEET 1"
+✅ Correct: {"rev_value": "A", "confidence": "high"}
+
+Example 6 - NO REV (truly absent):
+Title block has DWG NO, SHEET, SCALE but NO REV field at all
+✅ Correct: {"rev_value": "NO_REV", "confidence": "high", "notes": "No REV field present"}
+
+Example 7 - NO REV (empty field):
+Title block shows "REV: ____" (blank/empty)
+✅ Correct: {"rev_value": "NO_REV", "confidence": "high", "notes": "REV field empty"}
+
+REMEMBER:
+- Hyphenated numbers like 2-0, 3-0, 1-0 are STANDARD REV formats → return them confidently
+- Only use NO_REV when the field truly doesn't exist or is empty
+- Trust what you see in the title block
 """
 
 @dataclass
@@ -204,13 +183,9 @@ def _normalize_rev_value(raw: Any) -> str:
 def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResult:
     """
     Validate and correct GPT output using the real PDF text.
-
-    Behaviours:
-    - If GPT predicts a numeric hyphenated REV (e.g. 2-0, 3-0), we ensure it exists in text.
-      * If not, but there is exactly one numeric candidate, we correct to that.
-      * If not and there are 0 or >1 candidates, we force NO_REV (low confidence).
-    - If GPT predicts NO_REV/EMPTY, we try to salvage a single numeric REV found near a 'REV'
-      label in the text.
+    
+    This validation is LIGHT - we now trust GPT more since the prompt is clearer.
+    We only correct obvious hallucinations.
     """
     raw_value = result_data.get("rev_value", "")
     value = _normalize_rev_value(raw_value)
@@ -230,81 +205,29 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
     numeric_candidates = set(REV_NUMERIC_PATTERN.findall(text_upper))
 
     # ------------------------------
-    # 1) GPT said NO_REV / EMPTY
-    # ------------------------------
-    if value in {"NO_REV", "EMPTY"}:
-        # Try to salvage: if there's exactly ONE numeric REV near a REV label,
-        # we assume GPT was too conservative and use that.
-        if page_text and len(numeric_candidates) == 1:
-            candidate = next(iter(numeric_candidates))
-            near_pattern = re.compile(
-                rf"REV[^A-Z0-9]{{0,12}}{re.escape(candidate)}\b",
-                re.IGNORECASE,
-            )
-            if near_pattern.search(page_text):
-                # Override GPT's NO_REV
-                if notes:
-                    notes += " | "
-                notes += (
-                    f"GPT returned {value} but a single numeric REV {candidate} "
-                    "was found near a 'REV' label in page text; overriding."
-                )
-                return RevResult(
-                    file=pdf_path.name,
-                    value=candidate,
-                    engine=engine,
-                    confidence="medium",
-                    notes=notes,
-                )
-
-        # Otherwise, keep GPT's NO_REV/EMPTY but tidy confidence a bit
-        if not page_text:
-            if confidence == "high":
-                confidence = "medium"
-        else:
-            if "REV" not in text_upper and confidence in {"unknown", "low"}:
-                confidence = "medium"
-
-        if not notes:
-            notes = "Explicit NO_REV/EMPTY from GPT"
-        return RevResult(
-            file=pdf_path.name,
-            value=value,
-            engine=engine,
-            confidence=confidence,
-            notes=notes,
-        )
-
-    # ------------------------------
-    # 2) GPT predicted numeric REV
+    # If GPT returned a numeric REV, validate it exists on page
     # ------------------------------
     if REV_NUMERIC_PATTERN.fullmatch(value or ""):
         if value in numeric_candidates:
-            # Supported by page text – good
+            # Good: supported by page text
             if confidence in {"unknown", ""}:
                 confidence = "high"
         elif len(numeric_candidates) == 1:
-            # Snap to the single real candidate on the page
+            # GPT got wrong number but there's only one candidate - snap to it
             real_value = next(iter(numeric_candidates))
             if notes:
                 notes += " | "
-            notes += (
-                f"GPT suggested {value}, corrected to {real_value} based on page text"
-            )
+            notes += f"GPT suggested {value}, corrected to {real_value} based on page text"
             value = real_value
             confidence = "high"
         else:
-            # Numeric hallucination
+            # Multiple or no candidates - can't validate, but TRUST GPT since prompt is better now
+            # Only downgrade confidence, don't force NO_REV
+            if confidence == "high":
+                confidence = "medium"
             if notes:
                 notes += " | "
-            notes += "GPT numeric value not found on page; forcing NO_REV"
-            return RevResult(
-                file=pdf_path.name,
-                value="NO_REV",
-                engine=engine,
-                confidence="low",
-                notes=notes,
-            )
+            notes += "Could not validate numeric value in page text"
 
         return RevResult(
             file=pdf_path.name,
@@ -315,7 +238,42 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
         )
 
     # ------------------------------
-    # 3) Letter or other non-numeric value
+    # If GPT returned NO_REV/EMPTY
+    # ------------------------------
+    if value in {"NO_REV", "EMPTY"}:
+        # Light salvage: if there's exactly ONE numeric candidate near REV label, override
+        if page_text and len(numeric_candidates) == 1:
+            candidate = next(iter(numeric_candidates))
+            # More relaxed pattern - within 20 chars of REV
+            near_pattern = re.compile(
+                rf"REV[^A-Z0-9]{{0,20}}{re.escape(candidate)}\b",
+                re.IGNORECASE,
+            )
+            if near_pattern.search(page_text):
+                if notes:
+                    notes += " | "
+                notes += f"GPT returned {value} but found {candidate} near REV label; overriding"
+                return RevResult(
+                    file=pdf_path.name,
+                    value=candidate,
+                    engine=engine,
+                    confidence="medium",
+                    notes=notes,
+                )
+
+        # Keep GPT's NO_REV
+        if not notes:
+            notes = "No REV field found"
+        return RevResult(
+            file=pdf_path.name,
+            value=value,
+            engine=engine,
+            confidence=confidence,
+            notes=notes,
+        )
+
+    # ------------------------------
+    # Letter or other value - basic validation
     # ------------------------------
     if value and page_text:
         near_rev_pattern = re.compile(
@@ -323,11 +281,11 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
             re.IGNORECASE,
         )
         if not near_rev_pattern.search(page_text):
-            if notes:
-                notes += " | "
-            notes += "Value not found near a 'REV' label in text; may be unreliable"
             if confidence == "high":
                 confidence = "medium"
+            if notes:
+                notes += " | "
+            notes += "Value not found near REV label in text"
 
     return RevResult(
         file=pdf_path.name,
@@ -336,107 +294,6 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
         confidence=confidence or "unknown",
         notes=notes,
     )
-
-    
-# def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> "RevResult":
-#     """
-#     Validate and correct GPT output using the real PDF text.
-
-#     - Ensures numeric REVs (e.g. 2-0, 3-0) actually appear on the page.
-#     - If GPT's numeric value doesn't exist but there is exactly one candidate on the page,
-#       we snap to that candidate.
-#     - If GPT's value can't be supported by page text, we downgrade to NO_REV (low confidence).
-#     """
-#     raw_value = result_data.get("rev_value", "")
-#     value = _normalize_rev_value(raw_value)
-#     confidence = (result_data.get("confidence") or "unknown").lower()
-#     notes = result_data.get("notes") or ""
-#     engine = "gpt_vision"
-
-#     # Try to read page text once
-#     page_text = ""
-#     try:
-#         with fitz.open(pdf_path) as doc:
-#             page_text = doc[0].get_text("text") or ""
-#     except Exception:
-#         # If we can't read text, just trust GPT but mark as lower confidence
-#         page_text = ""
-
-#     text_upper = page_text.upper()
-
-#     # Explicit NO_REV / EMPTY – keep, but adjust confidence a bit
-#     if value in {"NO_REV", "EMPTY"}:
-#         if not page_text:
-#             # No text at all – be conservative
-#             confidence = "medium" if confidence == "high" else confidence
-#         else:
-#             if "REV" not in text_upper:
-#                 confidence = "high"
-#             elif value == "NO_REV" and "REV" in text_upper:
-#                 # REV mentioned but GPT says NO_REV → medium at best
-#                 if confidence == "high":
-#                     confidence = "medium"
-#         return RevResult(
-#             file=pdf_path.name,
-#             value=value,
-#             engine=engine,
-#             confidence=confidence,
-#             notes=notes or "Explicit NO_REV/EMPTY from GPT",
-#         )
-
-#     # Collect all candidate numeric REVs on the page
-#     numeric_candidates = set(REV_NUMERIC_PATTERN.findall(text_upper))
-
-#     if REV_NUMERIC_PATTERN.fullmatch(value or ""):
-#         # GPT predicted a hyphenated numeric revision
-#         if value in numeric_candidates:
-#             # Good: the page text contains exactly what GPT said
-#             if confidence in {"unknown", ""}:
-#                 confidence = "high"
-#         elif len(numeric_candidates) == 1:
-#             # GPT hallucinated, but there is a single clear numeric candidate on the page
-#             real_value = next(iter(numeric_candidates))
-#             notes = (notes + " | " if notes else "") + (
-#                 f"GPT suggested {value}, corrected to {real_value} based on page text"
-#             )
-#             value = real_value
-#             confidence = "high"
-#         else:
-#             # GPT numeric value not supported by page text → treat as hallucination
-#             notes = (notes + " | " if notes else "") + (
-#                 "GPT numeric value not found on page; forcing NO_REV"
-#             )
-#             value = "NO_REV"
-#             confidence = "low"
-#             return RevResult(
-#                 file=pdf_path.name,
-#                 value=value,
-#                 engine=engine,
-#                 confidence=confidence,
-#                 notes=notes,
-#             )
-#     else:
-#         # Letter or other non-numeric value: basic sanity check – is it near a REV label?
-#         if value and page_text:
-#             pattern = re.compile(
-#                 rf"REV[^A-Z0-9]{{0,6}}{re.escape(value)}\b",
-#                 re.IGNORECASE,
-#             )
-#             if not pattern.search(page_text):
-#                 # Value not obviously tied to a REV field; downgrade confidence slightly
-#                 notes = (notes + " | " if notes else "") + (
-#                     "Value not found near a 'REV' label in text; may be unreliable"
-#                 )
-#                 if confidence == "high":
-#                     confidence = "medium"
-
-#     return RevResult(
-#         file=pdf_path.name,
-#         value=value,
-#         engine=engine,
-#         confidence=confidence or "unknown",
-#         notes=notes,
-#     )
 
 
 class AzureGPTExtractor:
@@ -458,7 +315,7 @@ class AzureGPTExtractor:
                 azure_endpoint=endpoint,
             )
             self.deployment_name = deployment_name
-            LOG.info("✓ GPT client initialized successfully")
+            LOG.info("✓ GPT client initialized")
         except Exception as e:
             LOG.error(f"Failed to initialize GPT client: {e}")
             raise
@@ -473,10 +330,10 @@ class AzureGPTExtractor:
             png_bytes = pix.tobytes("png")
         return base64.b64encode(png_bytes).decode("utf-8")
 
-    def extract_rev(self, pdf_path: Path) -> "RevResult":
-        """Extract REV using Azure GPT-4 vision with strong post-validation."""
+    def extract_rev(self, pdf_path: Path) -> RevResult:
+        """Extract REV using Azure GPT-4 vision with updated confident prompt."""
         try:
-            LOG.debug(f"Converting {pdf_path.name} to image for GPT...")
+            LOG.debug(f"Converting {pdf_path.name} to image...")
             img_base64 = self.pdf_to_base64_image(pdf_path, page_idx=0, dpi=150)
 
             LOG.debug(f"Sending {pdf_path.name} to GPT API...")
@@ -493,11 +350,10 @@ class AzureGPTExtractor:
                             {
                                 "type": "text",
                                 "text": (
-                                    "Look at this engineering drawing and extract the REV value "
-                                    "from the TITLE BLOCK only. Do NOT use revision history tables "
-                                    "or grid letters. If the REV field is missing, blank, or you are "
-                                    "not completely sure what it says, respond with rev_value='NO_REV'. "
-                                    "Return ONLY the JSON object as described in the instructions."
+                                    "Extract the REV value from this engineering drawing. "
+                                    "Find the title block (bottom-right, with DWG NO, SHEET, SCALE). "
+                                    "Numeric formats like 2-0, 3-0, 1-0 are VALID and COMMON - return them confidently. "
+                                    "Only return NO_REV if there's truly no REV field or it's empty."
                                 ),
                             },
                             {
@@ -514,7 +370,7 @@ class AzureGPTExtractor:
             )
 
             result_text = response.choices[0].message.content or ""
-            LOG.debug(f"Raw GPT response for {pdf_path.name}: {result_text[:200]!r}")
+            LOG.debug(f"Raw GPT response: {result_text[:200]}")
 
             # Strip code fences if present
             import json
@@ -526,7 +382,7 @@ class AzureGPTExtractor:
 
             result_data = json.loads(result_text.strip())
 
-            # Post-process and validate against actual PDF text
+            # Light validation
             return _validate_gpt_result(pdf_path, result_data)
 
         except Exception as e:
@@ -548,16 +404,13 @@ def run_hybrid_pipeline(
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     
-    # Validate Azure config
     if not azure_endpoint or not azure_key:
-        LOG.error("Azure endpoint or key not provided. Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY.")
+        LOG.error("Azure endpoint or key not provided")
         return rows
     
-    # Initialize GPT client
     LOG.info("Initializing Azure GPT client...")
     gpt = AzureGPTExtractor(azure_endpoint, azure_key, deployment_name)
     
-    # Get PDFs
     pdfs = list(input_folder.glob("*.pdf"))
     if not pdfs:
         LOG.warning(f"No PDFs found in {input_folder}")
@@ -569,13 +422,13 @@ def run_hybrid_pipeline(
     
     for pdf_path in tqdm(pdfs, desc="Processing PDFs"):
         try:
-            # Step 1: Try PyMuPDF native
+            # Try PyMuPDF native first
             result = extract_native_pymupdf(pdf_path)
             
             if result and result.value and result.value not in ["", "NO_REV"]:
                 native_success += 1
             else:
-                # Step 2: Fallback to GPT
+                # Fallback to GPT
                 gpt_used += 1
                 result = gpt.extract_rev(pdf_path)
                 if result.engine == "gpt_failed":
@@ -617,26 +470,21 @@ def run_hybrid_pipeline(
     return rows
 
 def parse_args(argv=None):
-    a = argparse.ArgumentParser(description="PyMuPDF + GPT hybrid (optimized)")
+    a = argparse.ArgumentParser(description="PyMuPDF + GPT hybrid (FIXED)")
     a.add_argument("input_folder", type=Path)
-    a.add_argument("-o", "--output", type=Path, default=Path("rev_results_updated.csv"))
+    a.add_argument("-o", "--output", type=Path, default=Path("rev_results.csv"))
     a.add_argument("--azure-endpoint", type=str,
-                   default=os.getenv("AZURE_OPENAI_ENDPOINT"),
-                   help="Azure OpenAI endpoint URL")
+                   default=os.getenv("AZURE_OPENAI_ENDPOINT"))
     a.add_argument("--azure-key", type=str,
-                   default=os.getenv("AZURE_OPENAI_KEY"),
-                   help="Azure OpenAI key")
-    a.add_argument("--deployment-name", type=str, default="gpt-4.1",
-                   help="Azure OpenAI deployment name (default: gpt-4.1)")
+                   default=os.getenv("AZURE_OPENAI_KEY"))
+    a.add_argument("--deployment-name", type=str, default="gpt-4.1")
     return a.parse_args(argv)
 
 def main(argv=None):
     args = parse_args(argv)
     
     if not args.azure_endpoint or not args.azure_key:
-        LOG.error("Azure configuration missing. Set environment variables or pass flags:")
-        LOG.error("  export AZURE_OPENAI_ENDPOINT='https://...'")
-        LOG.error("  export AZURE_OPENAI_KEY='your_key'")
+        LOG.error("Azure credentials required")
         return []
     
     return run_hybrid_pipeline(

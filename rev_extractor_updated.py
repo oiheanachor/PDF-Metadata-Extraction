@@ -209,7 +209,7 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
     - If GPT predicts a numeric hyphenated REV (e.g. 2-0, 3-0), we ensure it exists in text.
       * If not, but there is exactly one numeric candidate, we correct to that.
       * If not and there are 0 or >1 candidates, we force NO_REV (low confidence).
-    - NEW: If GPT predicts NO_REV/EMPTY, we try to salvage a single numeric REV found near a 'REV'
+    - If GPT predicts NO_REV/EMPTY, we try to salvage a single numeric REV found near a 'REV'
       label in the text.
     """
     raw_value = result_data.get("rev_value", "")
@@ -274,6 +274,69 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
             confidence=confidence,
             notes=notes,
         )
+
+    # ------------------------------
+    # 2) GPT predicted numeric REV
+    # ------------------------------
+    if REV_NUMERIC_PATTERN.fullmatch(value or ""):
+        if value in numeric_candidates:
+            # Supported by page text – good
+            if confidence in {"unknown", ""}:
+                confidence = "high"
+        elif len(numeric_candidates) == 1:
+            # Snap to the single real candidate on the page
+            real_value = next(iter(numeric_candidates))
+            if notes:
+                notes += " | "
+            notes += (
+                f"GPT suggested {value}, corrected to {real_value} based on page text"
+            )
+            value = real_value
+            confidence = "high"
+        else:
+            # Numeric hallucination
+            if notes:
+                notes += " | "
+            notes += "GPT numeric value not found on page; forcing NO_REV"
+            return RevResult(
+                file=pdf_path.name,
+                value="NO_REV",
+                engine=engine,
+                confidence="low",
+                notes=notes,
+            )
+
+        return RevResult(
+            file=pdf_path.name,
+            value=value,
+            engine=engine,
+            confidence=confidence or "unknown",
+            notes=notes,
+        )
+
+    # ------------------------------
+    # 3) Letter or other non-numeric value
+    # ------------------------------
+    if value and page_text:
+        near_rev_pattern = re.compile(
+            rf"REV[^A-Z0-9]{{0,8}}{re.escape(value)}\b",
+            re.IGNORECASE,
+        )
+        if not near_rev_pattern.search(page_text):
+            if notes:
+                notes += " | "
+            notes += "Value not found near a 'REV' label in text; may be unreliable"
+            if confidence == "high":
+                confidence = "medium"
+
+    return RevResult(
+        file=pdf_path.name,
+        value=value,
+        engine=engine,
+        confidence=confidence or "unknown",
+        notes=notes,
+    )
+
     
 # def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> "RevResult":
 #     """

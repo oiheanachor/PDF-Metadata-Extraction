@@ -209,98 +209,133 @@ def _normalize_rev_value(raw: Any) -> str:
     v = v.replace(" ", "")
     return v
 
-
-def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> "RevResult":
+def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResult:
     """
     Validate and correct GPT output using the real PDF text.
 
-    - Ensures numeric REVs (e.g. 2-0, 3-0) actually appear on the page.
-    - If GPT's numeric value doesn't exist but there is exactly one candidate on the page,
-      we snap to that candidate.
-    - If GPT's value can't be supported by page text, we downgrade to NO_REV (low confidence).
+    Behaviours:
+    - If GPT predicts a numeric hyphenated REV (e.g. 2-0, 3-0), we ensure it exists in text.
+      * If not, but there is exactly one numeric candidate, we correct to that.
+      * If not and there are 0 or >1 candidates, we force NO_REV (low confidence).
+    - NEW: If GPT predicts NO_REV/EMPTY, we try to salvage a single numeric REV found near a 'REV'
+      label in the text.
     """
     raw_value = result_data.get("rev_value", "")
     value = _normalize_rev_value(raw_value)
     confidence = (result_data.get("confidence") or "unknown").lower()
-    notes = result_data.get("notes") or ""
+    notes = (result_data.get("notes") or "").strip()
     engine = "gpt_vision"
 
-    # Try to read page text once
-    page_text = ""
+    # Read page text once
     try:
         with fitz.open(pdf_path) as doc:
-            page_text = doc[0].get_text("text") or ""
+            page_text = (doc[0].get_text("text") or "")
     except Exception:
-        # If we can't read text, just trust GPT but mark as lower confidence
         page_text = ""
-
     text_upper = page_text.upper()
 
-    # Explicit NO_REV / EMPTY – keep, but adjust confidence a bit
+    # Collect numeric candidates up-front
+    numeric_candidates = set(REV_NUMERIC_PATTERN.findall(text_upper))
+
+    # ------------------------------
+    # 1) GPT said NO_REV / EMPTY
+    # ------------------------------
     if value in {"NO_REV", "EMPTY"}:
+        # Try to salvage: if there's exactly ONE numeric REV near a REV label,
+        # we assume GPT was too conservative and use that.
+        if page_text and len(numeric_candidates) == 1:
+            candidate = next(iter(numeric_candidates))
+            near_pattern = re.compile(
+                rf"REV[^A-Z0-9]{{0,12}}{re.escape(candidate)}\b",
+                re.IGNORECASE,
+            )
+            if near_pattern.search(page_text):
+                # Override GPT's NO_REV
+                if notes:
+                    notes += " | "
+                notes += (
+                    f"GPT returned {value} but a single numeric REV {candidate} "
+                    "was found near a 'REV' label in page text; overriding."
+                )
+                return RevResult(
+                    file=pdf_path.name,
+                    value=candidate,
+                    engine=engine,
+                    confidence="medium",
+                    notes=notes,
+                )
+
+        # Otherwise, keep GPT's NO_REV/EMPTY but tidy confidence a bit
         if not page_text:
-            # No text at all – be conservative
-            confidence = "medium" if confidence == "high" else confidence
+            if confidence == "high":
+                confidence = "medium"
         else:
-            if "REV" not in text_upper:
-                confidence = "high"
-            elif value == "NO_REV" and "REV" in text_upper:
-                # REV mentioned but GPT says NO_REV → medium at best
-                if confidence == "high":
-                    confidence = "medium"
+            if "REV" not in text_upper and confidence in {"unknown", "low"}:
+                confidence = "medium"
+
+        if not notes:
+            notes = "Explicit NO_REV/EMPTY from GPT"
         return RevResult(
             file=pdf_path.name,
             value=value,
             engine=engine,
             confidence=confidence,
-            notes=notes or "Explicit NO_REV/EMPTY from GPT",
+            notes=notes,
         )
 
-    # Collect all candidate numeric REVs on the page
-    numeric_candidates = set(REV_NUMERIC_PATTERN.findall(text_upper))
-
+    # ------------------------------
+    # 2) GPT predicted numeric REV
+    # ------------------------------
     if REV_NUMERIC_PATTERN.fullmatch(value or ""):
-        # GPT predicted a hyphenated numeric revision
         if value in numeric_candidates:
-            # Good: the page text contains exactly what GPT said
+            # Supported by text – good
             if confidence in {"unknown", ""}:
                 confidence = "high"
         elif len(numeric_candidates) == 1:
-            # GPT hallucinated, but there is a single clear numeric candidate on the page
+            # Snap to the single real candidate
             real_value = next(iter(numeric_candidates))
-            notes = (notes + " | " if notes else "") + (
+            if notes:
+                notes += " | "
+            notes += (
                 f"GPT suggested {value}, corrected to {real_value} based on page text"
             )
             value = real_value
             confidence = "high"
         else:
-            # GPT numeric value not supported by page text → treat as hallucination
-            notes = (notes + " | " if notes else "") + (
-                "GPT numeric value not found on page; forcing NO_REV"
-            )
-            value = "NO_REV"
-            confidence = "low"
+            # Numeric hallucination
+            if notes:
+                notes += " | "
+            notes += "GPT numeric value not found on page; forcing NO_REV"
             return RevResult(
                 file=pdf_path.name,
-                value=value,
+                value="NO_REV",
                 engine=engine,
-                confidence=confidence,
+                confidence="low",
                 notes=notes,
             )
-    else:
-        # Letter or other non-numeric value: basic sanity check – is it near a REV label?
-        if value and page_text:
-            pattern = re.compile(
-                rf"REV[^A-Z0-9]{{0,6}}{re.escape(value)}\b",
-                re.IGNORECASE,
-            )
-            if not pattern.search(page_text):
-                # Value not obviously tied to a REV field; downgrade confidence slightly
-                notes = (notes + " | " if notes else "") + (
-                    "Value not found near a 'REV' label in text; may be unreliable"
-                )
-                if confidence == "high":
-                    confidence = "medium"
+
+        return RevResult(
+            file=pdf_path.name,
+            value=value,
+            engine=engine,
+            confidence=confidence or "unknown",
+            notes=notes,
+        )
+
+    # ------------------------------
+    # 3) Letter or other value
+    # ------------------------------
+    if value and page_text:
+        near_rev_pattern = re.compile(
+            rf"REV[^A-Z0-9]{{0,8}}{re.escape(value)}\b",
+            re.IGNORECASE,
+        )
+        if not near_rev_pattern.search(page_text):
+            if notes:
+                notes += " | "
+            notes += "Value not found near a 'REV' label in text; may be unreliable"
+            if confidence == "high":
+                confidence = "medium"
 
     return RevResult(
         file=pdf_path.name,
@@ -309,7 +344,6 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> "RevRes
         confidence=confidence or "unknown",
         notes=notes,
     )
-
 
 class AzureGPTExtractor:
     def __init__(self, endpoint: str, api_key: str, deployment_name: str = "gpt-4.1"):

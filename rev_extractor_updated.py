@@ -53,23 +53,21 @@ NUMERIC REVISIONS (very common)
 - These are MAJOR-MINOR versions. Example: 2-0 ≈ "2.0".
 - You MUST copy the digits exactly as shown (2-0 is NOT the same as 3-0).
 
-LETTER REVISIONS
+LETTER REVISIONS (very common)
 - Single letter: A, B, C, D, …, Z
 - Double letters: AA, AB, AC, etc.
 
 SPECIAL CASES
-- If the REV field shows "OF" or something clearly meaning "not applicable":
-  → rev_value = "EMPTY"
 - If there is no REV field at all, OR the field is clearly empty:
   → rev_value = "NO_REV"
 
 4. THINGS TO IGNORE (COMMON MISTAKES)
 DO NOT return any of the following as the REV value:
+- Any text that is not in or immediately next to the REV field in the TITLE BLOCK.
 - Entries in REVISION HISTORY TABLES (often top-right, columns like: REV | ECO | DATE | DESCRIPTION).
 - Grid letters around the border (A, B, C, 1, 2, 3).
 - Section markers (e.g. "SECTION C-C", "DETAIL A").
 - Part numbers, item callouts, or drawing numbers.
-- Any text that is not in or immediately next to the REV field in the TITLE BLOCK.
 
 5. VALIDATION CHECKLIST BEFORE ANSWERING
 Before you answer, confirm ALL of these:
@@ -154,35 +152,29 @@ def extract_native_pymupdf(pdf_path: Path) -> Optional[RevResult]:
     try:
         from rev_extractor_fixed import (
             process_pdf_native, _normalize_output_value,
-            _detect_numeric_rev, _detect_letter_rev
+            DEFAULT_BR_X, DEFAULT_BR_Y, DEFAULT_EDGE_MARGIN, DEFAULT_REV_2L_BLOCKLIST
         )
-    except ImportError:
-        LOG.warning("rev_extractor_fixed.py not available, skipping native extraction.")
+        
+        best = process_pdf_native(
+            pdf_path,
+            brx=DEFAULT_BR_X,
+            bry=DEFAULT_BR_Y,
+            blocklist=DEFAULT_REV_2L_BLOCKLIST,
+            edge_margin=DEFAULT_EDGE_MARGIN
+        )
+        
+        if best and best.value:
+            value = _normalize_output_value(best.value)
+            return RevResult(
+                file=pdf_path.name,
+                value=value,
+                engine=f"pymupdf_{best.engine}",
+                confidence="high" if best.score > 100 else "medium",
+                notes=best.context_snippet
+            )
         return None
-    
-    try:
-        value, info = process_pdf_native(pdf_path)
-        if not value:
-            return None
-        
-        norm = _normalize_output_value(value)
-        confidence = "high" if info.get("source") == "title_block" else "medium"
-        
-        notes_parts = []
-        if info.get("source"):
-            notes_parts.append(f"source={info['source']}")
-        if info.get("reason"):
-            notes_parts.append(info["reason"])
-        
-        return RevResult(
-            file=pdf_path.name,
-            value=norm,
-            engine="native_pymupdf",
-            confidence=confidence,
-            notes="; ".join(notes_parts)
-        )
     except Exception as e:
-        LOG.error(f"Native PyMuPDF extraction failed for {pdf_path.name}: {e}")
+        LOG.debug(f"Native extraction failed for {pdf_path.name}: {e}")
         return None
 
 REV_NUMERIC_PATTERN = re.compile(r"\b\d{1,3}-\d{1,2}\b")
@@ -282,68 +274,107 @@ def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> RevResu
             confidence=confidence,
             notes=notes,
         )
+    
+# def _validate_gpt_result(pdf_path: Path, result_data: Dict[str, Any]) -> "RevResult":
+#     """
+#     Validate and correct GPT output using the real PDF text.
 
-    # ------------------------------
-    # 2) GPT predicted numeric REV
-    # ------------------------------
-    if REV_NUMERIC_PATTERN.fullmatch(value or ""):
-        if value in numeric_candidates:
-            # Supported by text – good
-            if confidence in {"unknown", ""}:
-                confidence = "high"
-        elif len(numeric_candidates) == 1:
-            # Snap to the single real candidate
-            real_value = next(iter(numeric_candidates))
-            if notes:
-                notes += " | "
-            notes += (
-                f"GPT suggested {value}, corrected to {real_value} based on page text"
-            )
-            value = real_value
-            confidence = "high"
-        else:
-            # Numeric hallucination
-            if notes:
-                notes += " | "
-            notes += "GPT numeric value not found on page; forcing NO_REV"
-            return RevResult(
-                file=pdf_path.name,
-                value="NO_REV",
-                engine=engine,
-                confidence="low",
-                notes=notes,
-            )
+#     - Ensures numeric REVs (e.g. 2-0, 3-0) actually appear on the page.
+#     - If GPT's numeric value doesn't exist but there is exactly one candidate on the page,
+#       we snap to that candidate.
+#     - If GPT's value can't be supported by page text, we downgrade to NO_REV (low confidence).
+#     """
+#     raw_value = result_data.get("rev_value", "")
+#     value = _normalize_rev_value(raw_value)
+#     confidence = (result_data.get("confidence") or "unknown").lower()
+#     notes = result_data.get("notes") or ""
+#     engine = "gpt_vision"
 
-        return RevResult(
-            file=pdf_path.name,
-            value=value,
-            engine=engine,
-            confidence=confidence or "unknown",
-            notes=notes,
-        )
+#     # Try to read page text once
+#     page_text = ""
+#     try:
+#         with fitz.open(pdf_path) as doc:
+#             page_text = doc[0].get_text("text") or ""
+#     except Exception:
+#         # If we can't read text, just trust GPT but mark as lower confidence
+#         page_text = ""
 
-    # ------------------------------
-    # 3) Letter or other value
-    # ------------------------------
-    if value and page_text:
-        near_rev_pattern = re.compile(
-            rf"REV[^A-Z0-9]{{0,8}}{re.escape(value)}\b",
-            re.IGNORECASE,
-        )
-        if not near_rev_pattern.search(page_text):
-            if notes:
-                notes += " | "
-            notes += "Value not found near a 'REV' label in text; may be unreliable"
-            if confidence == "high":
-                confidence = "medium"
+#     text_upper = page_text.upper()
 
-    return RevResult(
-        file=pdf_path.name,
-        value=value,
-        engine=engine,
-        confidence=confidence or "unknown",
-        notes=notes,
-    )
+#     # Explicit NO_REV / EMPTY – keep, but adjust confidence a bit
+#     if value in {"NO_REV", "EMPTY"}:
+#         if not page_text:
+#             # No text at all – be conservative
+#             confidence = "medium" if confidence == "high" else confidence
+#         else:
+#             if "REV" not in text_upper:
+#                 confidence = "high"
+#             elif value == "NO_REV" and "REV" in text_upper:
+#                 # REV mentioned but GPT says NO_REV → medium at best
+#                 if confidence == "high":
+#                     confidence = "medium"
+#         return RevResult(
+#             file=pdf_path.name,
+#             value=value,
+#             engine=engine,
+#             confidence=confidence,
+#             notes=notes or "Explicit NO_REV/EMPTY from GPT",
+#         )
+
+#     # Collect all candidate numeric REVs on the page
+#     numeric_candidates = set(REV_NUMERIC_PATTERN.findall(text_upper))
+
+#     if REV_NUMERIC_PATTERN.fullmatch(value or ""):
+#         # GPT predicted a hyphenated numeric revision
+#         if value in numeric_candidates:
+#             # Good: the page text contains exactly what GPT said
+#             if confidence in {"unknown", ""}:
+#                 confidence = "high"
+#         elif len(numeric_candidates) == 1:
+#             # GPT hallucinated, but there is a single clear numeric candidate on the page
+#             real_value = next(iter(numeric_candidates))
+#             notes = (notes + " | " if notes else "") + (
+#                 f"GPT suggested {value}, corrected to {real_value} based on page text"
+#             )
+#             value = real_value
+#             confidence = "high"
+#         else:
+#             # GPT numeric value not supported by page text → treat as hallucination
+#             notes = (notes + " | " if notes else "") + (
+#                 "GPT numeric value not found on page; forcing NO_REV"
+#             )
+#             value = "NO_REV"
+#             confidence = "low"
+#             return RevResult(
+#                 file=pdf_path.name,
+#                 value=value,
+#                 engine=engine,
+#                 confidence=confidence,
+#                 notes=notes,
+#             )
+#     else:
+#         # Letter or other non-numeric value: basic sanity check – is it near a REV label?
+#         if value and page_text:
+#             pattern = re.compile(
+#                 rf"REV[^A-Z0-9]{{0,6}}{re.escape(value)}\b",
+#                 re.IGNORECASE,
+#             )
+#             if not pattern.search(page_text):
+#                 # Value not obviously tied to a REV field; downgrade confidence slightly
+#                 notes = (notes + " | " if notes else "") + (
+#                     "Value not found near a 'REV' label in text; may be unreliable"
+#                 )
+#                 if confidence == "high":
+#                     confidence = "medium"
+
+#     return RevResult(
+#         file=pdf_path.name,
+#         value=value,
+#         engine=engine,
+#         confidence=confidence or "unknown",
+#         notes=notes,
+#     )
+
 
 class AzureGPTExtractor:
     def __init__(self, endpoint: str, api_key: str, deployment_name: str = "gpt-4.1"):
@@ -525,7 +556,7 @@ def run_hybrid_pipeline(
 def parse_args(argv=None):
     a = argparse.ArgumentParser(description="PyMuPDF + GPT hybrid (optimized)")
     a.add_argument("input_folder", type=Path)
-    a.add_argument("-o", "--output", type=Path, default=Path("rev_results.csv"))
+    a.add_argument("-o", "--output", type=Path, default=Path("rev_results_updated.csv"))
     a.add_argument("--azure-endpoint", type=str,
                    default=os.getenv("AZURE_OPENAI_ENDPOINT"),
                    help="Azure OpenAI endpoint URL")

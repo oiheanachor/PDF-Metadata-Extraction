@@ -20,6 +20,7 @@ try:
     from rev_extractor_fixed import (
         process_pdf_native, _normalize_output_value,
         is_plausible_rev_value, is_suspicious_rev_value, canonicalize_rev_value,
+        is_special_char,  # NEW: For special character detection
         DEFAULT_BR_X, DEFAULT_BR_Y, DEFAULT_EDGE_MARGIN, DEFAULT_REV_2L_BLOCKLIST
     )
     NATIVE_AVAILABLE = True
@@ -307,6 +308,10 @@ def compare_and_decide(
     native_plausible = is_plausible_rev_value(native_val)
     gpt_plausible = is_plausible_rev_value(gpt_val)
     
+    # Log special character scenarios
+    if is_special_char(native_val):
+        LOG.info(f"  Native returned special char '{native_val}', GPT returned '{gpt_val}'")
+    
     # Both agree
     if native_val == gpt_val:
         return RevResult(
@@ -361,7 +366,7 @@ def compare_and_decide(
             value=gpt_val,
             engine="gpt_valid",
             confidence="medium",
-            notes=f"Chose GPT {gpt_val} (PyMuPDF {native_val} invalid)",
+            notes=f"Chose GPT '{gpt_val}' (PyMuPDF '{native_val}' invalid/suspicious)",
             human_review=False,
             review_reason=""
         )

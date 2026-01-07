@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — PROPERLY FIXED VERSION
-Fixes the critical tuple/dict type mismatch that caused 100% PyMuPDF failure
-Maintains all proven scoring logic, adds small dot+letter boost
+REV Extractor — Fixed Version (Compatible with rev_extractor_updated_v2_patched.py)
+Fixes critical type mismatch bug, maintains proven scoring, adds notes attribute
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import fitz  # PyMuPDF
 from tqdm import tqdm
 
-LOG = logging.getLogger("rev_extractor_working")
+LOG = logging.getLogger("rev_extractor_fixed")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ----------------------------- Patterns & Constants -----------------------------
@@ -95,12 +94,16 @@ class PageResult:
 
 @dataclass
 class RevHit:
+    """
+    Compatible with rev_extractor_updated_v2_patched.py wrapper
+    """
     file: str
     page: int
     value: str
     engine: str
     score: float
     context_snippet: str
+    notes: str = ""  # Added for wrapper compatibility
 
 # ----------------------------- Utilities ---------------------------------------
 
@@ -226,7 +229,6 @@ def score_candidates_bottom_right_first(
 ) -> Optional[Tuple[str, float, Tuple[float, float], str]]:
     """
     Returns (value, score, center, context) or None
-    FIXED: Returns tuple consistently
     """
     block = {t.upper() for t in (blocklist or set())}
 
@@ -251,7 +253,7 @@ def score_candidates_bottom_right_first(
         return bool(re.fullmatch(r"\.[A-Z]{1,2}", s) or re.fullmatch(r"[A-Z]{1,2}\.", s))
 
     def base_score_for(v: str) -> float:
-        if is_dot_letter(v):      return 25.0  # NEW: Boost for dot+letter
+        if is_dot_letter(v):      return 25.0  # Boost for dot+letter
         if is_hyphen_code(v):     return 40.0
         if is_double_letter(v):   return 14.0
         if is_single_letter(v):   return 4.0
@@ -440,7 +442,10 @@ def analyze_page_native(
 # ----------------------------- File Processing ----------------------------------
 
 def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, edge_margin: float) -> Optional[RevHit]:
-    """Process all pages, return best REV hit."""
+    """
+    Process all pages, return best REV hit.
+    Compatible with rev_extractor_updated_v2_patched.py wrapper.
+    """
     hits: Dict[int, RevHit] = {}
     with fitz.open(pdf_path) as d:
         n = len(d)
@@ -459,7 +464,8 @@ def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, e
                 value=value,
                 engine=engine,
                 score=score,
-                context_snippet=ctx
+                context_snippet=ctx,
+                notes=""  # Empty notes for native extraction
             )
     
     if not hits:
@@ -471,9 +477,10 @@ def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, e
 # ----------------------------- Main ---------------------------------------------
 
 def main():
-    p = argparse.ArgumentParser(description="REV Extractor - Properly Fixed")
+    """Standalone CLI - for testing without wrapper."""
+    p = argparse.ArgumentParser(description="REV Extractor - Fixed & Compatible")
     p.add_argument("input_folder", type=Path)
-    p.add_argument("-o", "--output", type=Path, default=Path("rev_results_working.csv"))
+    p.add_argument("-o", "--output", type=Path, default=Path("rev_results_fixed.csv"))
     p.add_argument("--brx", type=float, default=DEFAULT_BR_X)
     p.add_argument("--bry", type=float, default=DEFAULT_BR_Y)
     p.add_argument("--edge-margin", type=float, default=DEFAULT_EDGE_MARGIN)

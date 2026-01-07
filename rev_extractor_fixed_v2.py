@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — PROPERLY Fixed with Correct Scoring Hierarchy
-Fixes special character scoring bug that caused valid letters to be beaten by dashes
+REV Extractor — Enhanced with Edge Case Handling
+Based on proven rev_extractor_fixed.py with SURGICAL additions for ~300/4500 edge cases
 """
 
 from __future__ import annotations
@@ -19,13 +19,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 # ----------------------------- Patterns & Constants -----------------------------
 
-REV_VALUE_RE = re.compile(r"^(?:[A-Z]{1,2}|\.[A-Z]{1,2}|[A-Z]{1,2}\.|\.?\d{1,3}-\d{1,3}\.?|-+|_+|\.-+|\._+)$")
+# ENHANCED: Added special characters (-, _, .-, ._, etc.)
+REV_VALUE_RE = re.compile(
+    r"^(?:"
+    r"[A-Z]{1,2}|"              # A, B, AA, AB
+    r"\d{1,3}-\d{1,3}|"         # 1-0, 2-0, 5-40
+    r"-+|_+|"                   # -, __, ___
+    r"\.-+|\._+"                # .-, ._
+    r")$"
+)
 
 def canonicalize_rev_value(v: str) -> str:
-    """Canonicalise REV values while preserving meaning."""
+    """Canonicalise REV values."""
     s = norm_val(v)
     if s in {"", "NO_REV", "NONE", "N/A"}:
         return "NO_REV"
+    # Normalize special characters
     if re.fullmatch(r"-{1,}", s):
         return "-"
     if re.fullmatch(r"_{1,}", s):
@@ -37,31 +46,49 @@ def canonicalize_rev_value(v: str) -> str:
     return s
 
 def is_plausible_rev_value(v: str) -> bool:
-    """Domain plausibility checks."""
+    """
+    NEW: Domain validation rules for edge cases.
+    Returns True if valid, False if suspicious.
+    """
     s = canonicalize_rev_value(v)
+    
     if s == "NO_REV":
         return True
+    
+    # Special characters ARE valid (-, _, .-, etc.)
     if s in {"-", "_", ".-", "._"}:
         return True
-    if re.fullmatch(r"[A-Z]{1,2}", s) or re.fullmatch(r"\.[A-Z]{1,2}", s) or re.fullmatch(r"[A-Z]{1,2}\.", s):
-        core = s.replace(".", "")
-        if len(core) == 2:
-            return core[0] in {"A", "B", "C"}
+    
+    # Single/double letters
+    if re.fullmatch(r"[A-Z]{1,2}", s):
+        if len(s) == 2:
+            # Double letters: first letter should be A, B, or C
+            return s[0] in {"A", "B", "C"}
         return True
+    
+    # Numeric hyphenated: should end with -0
     m = re.fullmatch(r"(\d{1,3})-(\d{1,3})", s)
     if m:
-        return m.group(2) == "0"
+        return m.group(2) == "0"  # Must be X-0 format
+    
     return False
 
 def is_suspicious_rev_value(v: str) -> bool:
+    """NEW: Check if value needs verification."""
     s = norm_val(v)
+    
+    # Single numeric only (1, 2, 202) is highly unlikely
     if re.fullmatch(r"\d{1,4}", s):
         return True
+    
+    # Rotation tokens
+    if s.upper() in {"LTR", "RTL"}:
+        return True
+    
     s2 = canonicalize_rev_value(s)
     return bool(REV_VALUE_RE.fullmatch(s2) and not is_plausible_rev_value(s2))
 
 REV_TOKEN_RE = re.compile(r"^rev\.?$", re.IGNORECASE)
-
 TITLE_ANCHORS = {"DWG", "DWG.", "DWGNO", "SHEET", "SCALE", "WEIGHT", "SIZE", "TITLE", "DRAWN", "CHECKED"}
 REV_TABLE_HEADERS = {
     "REVISIONS", "REVISION", "DESCRIPTION", "DESCRIPTIONS",
@@ -72,6 +99,7 @@ REV_TABLE_HEADERS = {
 DEFAULT_BR_X = 0.68
 DEFAULT_BR_Y = 0.72
 DEFAULT_EDGE_MARGIN = 0.018
+DEFAULT_REV_2L_BLOCKLIST = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"}
 
 # ----------------------------- Data Structures ---------------------------------
 
@@ -100,19 +128,24 @@ class RevHit:
     context_snippet: str
     notes: str = ""
 
-# ----------------------------- Utilities ---------------------------------------
+# ----------------------------- Utilities (ORIGINAL) ----------------------------
+
+def _scalarize(v: Any):
+    if isinstance(v, (list, tuple, set)):
+        return ", ".join(map(str, v))
+    if isinstance(v, dict):
+        return ", ".join(f"{k}={str(vv)}" for k, vv in v.items())
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="ignore")
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
 
 def norm_val(v: Any) -> str:
-    """Normalize token text."""
     if v is None:
         return ""
     s = str(v).replace("\u00A0", " ")
     s = re.sub(r"\s+", " ", s).strip()
-    s = (s.replace("–", "-").replace("—", "-").replace("−", "-")
-           .replace("‑", "-").replace("﹣", "-").replace("－", "-"))
-    s = s.replace("‾", "_").replace("¯", "_")
-    if re.fullmatch(r"\.?[A-Za-z]{1,3}\.?", s):
-        s = s.upper()
     return s
 
 def in_bottom_right(x: float, y: float, width: float, height: float) -> bool:
@@ -120,6 +153,19 @@ def in_bottom_right(x: float, y: float, width: float, height: float) -> bool:
 
 def in_bottom_right_strict(x: float, y: float, width: float, height: float, brx: float, bry: float) -> bool:
     return x >= width * brx and y >= height * bry
+
+def in_bottom_left_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    left_w = w * (1.0 - brx)
+    return x <= left_w and y >= h * bry
+
+def in_top_right_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    top_h = h * (1.0 - bry)
+    return x >= w * brx and y <= top_h
+
+def in_top_left_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    left_w = w * (1.0 - brx)
+    top_h = h * (1.0 - bry)
+    return x <= left_w and y <= top_h
 
 def in_top_half(y: float, height: float) -> bool:
     return y < height * 0.5
@@ -138,7 +184,7 @@ def context_snippet_from_tokens(tokens: List[Token], center: Tuple[float, float]
     s = re.sub(r"\s+", " ", s).strip()
     return s[:80]
 
-# ----------------------------- Native Tokenization ------------------------------
+# ----------------------------- Native Tokenization (ORIGINAL) ------------------
 
 def get_native_tokens(pdf_path: Path, page_index0: int) -> PageResult:
     tokens: List[Token] = []
@@ -155,10 +201,9 @@ def get_native_tokens(pdf_path: Path, page_index0: int) -> PageResult:
             text_parts.append(txt_clean)
     return PageResult(tokens=tokens, text=" ".join(text_parts), engine="native")
 
-# ----------------------------- Revision Table Detection ------------------------
+# ----------------------------- Revision Table Detection (ORIGINAL) -------------
 
 def is_in_revision_table(token: Token, all_tokens: List[Token], page_w: float, page_h: float) -> bool:
-    """Detect if token is in revision table."""
     if in_bottom_right_strict(token.x, token.y, page_w, page_h, 0.68, 0.72):
         return False
     if not in_top_half(token.y, page_h):
@@ -171,13 +216,17 @@ def is_in_revision_table(token: Token, all_tokens: List[Token], page_w: float, p
         return True
     return False
 
-# ----------------------------- Candidate Assembly ------------------------------
+def count_revision_table_headers_nearby(center_xy: Tuple[float, float], all_tokens: List[Token], radius: float = 350) -> int:
+    return sum(1 for t in all_tokens 
+               if distance((t.x, t.y), center_xy) <= radius 
+               and norm_val(t.text).upper() in REV_TABLE_HEADERS)
+
+# ----------------------------- Candidate Assembly (ORIGINAL) -------------------
 
 def _sort_by_x(tokens: List[Token]) -> List[Token]:
     return sorted(tokens, key=lambda t: (t.y, t.x))
 
 def assemble_inline_candidates(neighborhood: List[Token], line_tol: float = 0.85, gap_tol: float = 0.60) -> List[str]:
-    """Build candidate strings by concatenating adjacent tokens."""
     if not neighborhood:
         return []
     by_lines: List[List[Token]] = []
@@ -188,9 +237,7 @@ def assemble_inline_candidates(neighborhood: List[Token], line_tol: float = 0.85
             anchor = line[0]
             same_line = abs(t.y - anchor.y) <= max(anchor.h, t.h) * line_tol
             if same_line:
-                line.append(t)
-                placed = True
-                break
+                line.append(t); placed = True; break
         if not placed:
             by_lines.append([t])
 
@@ -211,7 +258,7 @@ def assemble_inline_candidates(neighborhood: List[Token], line_tol: float = 0.85
                 cands.add(texts[i] + texts[i+1] + texts[i+2])
     return list(cands)
 
-# ----------------------------- Scoring ------------------------------------------
+# ----------------------------- Scoring (ORIGINAL PRESERVED) --------------------
 
 def _nearby_anchor_bonus(tokens_in_zone: List[Token], center_xy: Tuple[float, float], radius=220) -> int:
     return sum(1 for a in tokens_in_zone
@@ -221,10 +268,8 @@ def score_candidates_bottom_right_first(
     tokens: List[Token], page_w: float, page_h: float,
     brx: float, bry: float, blocklist: Optional[set] = None,
     edge_margin: float = DEFAULT_EDGE_MARGIN
-) -> Optional[Tuple[str, float, Tuple[float, float], str]]:
-    """
-    Returns (value, score, center, context) or None
-    """
+):
+    """ORIGINAL SCORING - UNCHANGED"""
     block = {t.upper() for t in (blocklist or set())}
 
     br_tokens = [
@@ -237,30 +282,18 @@ def score_candidates_bottom_right_first(
 
     br_rev_labels = [t for t in br_tokens if REV_TOKEN_RE.match(norm_val(t.text))]
 
-    # Pattern detection
     def is_hyphen_code(s: str) -> bool:
         return bool(re.fullmatch(r"\d{1,2}-\d{1,2}", s))
     def is_double_letter(s: str) -> bool:
         return bool(re.fullmatch(r"[A-Z]{2}", s))
     def is_single_letter(s: str) -> bool:
         return bool(re.fullmatch(r"[A-Z]", s))
-    def is_dot_letter(s: str) -> bool:
-        return bool(re.fullmatch(r"\.[A-Z]{1,2}", s) or re.fullmatch(r"[A-Z]{1,2}\.", s))
-    def is_special_char(s: str) -> bool:
-        """Check if value is special character (-, _, etc.)"""
-        return bool(re.fullmatch(r"[-_]+|\.[-_]+", s))
 
     def base_score_for(v: str) -> float:
-        """
-        CRITICAL FIX: Special characters get LOWEST score
-        They should NEVER beat valid letters/numbers
-        """
-        if is_hyphen_code(v):     return 40.0  # Highest
-        if is_dot_letter(v):      return 25.0  # Dot+letter boost
-        if is_double_letter(v):   return 14.0
-        if is_single_letter(v):   return 4.0
-        if is_special_char(v):    return 0.5   # CRITICAL: Lowest priority!
-        return 2.0  # Other patterns
+        if is_hyphen_code(v):   return 40.0
+        if is_double_letter(v): return 14.0
+        if is_single_letter(v): return 4.0
+        return 8.0
 
     def neighborhood_around(cx: float, cy: float, radius: float = 300.0) -> List[Token]:
         return [t for t in br_tokens if distance((t.x, t.y), (cx, cy)) <= radius]
@@ -272,9 +305,11 @@ def score_candidates_bottom_right_first(
             v = norm_val(t.text)
             if not REV_VALUE_RE.match(v):
                 continue
-            if v.upper() in block:
+            vu = v.upper()
+            if vu in block:
                 continue
             if is_in_revision_table(t, tokens, page_w, page_h):
+                LOG.debug(f"Skipping '{v}' - detected in revision table")
                 continue
             
             d = distance((t.x, t.y), ref_xy) + 1e-3
@@ -290,10 +325,6 @@ def score_candidates_bottom_right_first(
                 score += 3.0
             
             score += _nearby_anchor_bonus(br_tokens, (t.x, t.y)) * 1.2
-            
-            if is_dot_letter(v):
-                LOG.debug(f"  Dot+letter: {v} (score: {score:.1f})")
-            
             cands.append((score, v, (t.x, t.y)))
 
         assembled = assemble_inline_candidates(neigh, line_tol=0.85, gap_tol=0.60)
@@ -318,19 +349,18 @@ def score_candidates_bottom_right_first(
         consider_token_or_assembled(anchor_xy, neigh, None)
 
     if not cands:
-        # Last resort: check for 'OF' or special chars
         for t in br_tokens:
-            v_upper = norm_val(t.text).upper()
-            if v_upper == "OF":
-                return ("OF", 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
-            # Only return special chars if EXPLICITLY near REV label with no other options
-            if is_special_char(norm_val(t.text)) and br_rev_labels:
-                near_rev = any(distance((t.x, t.y), (r.x, r.y)) <= 100 for r in br_rev_labels)
-                if near_rev:
-                    return (norm_val(t.text), 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
+            v = norm_val(t.text)
+            if v.upper() == "OF":
+                center = (t.x, t.y)
+                ctx = context_snippet_from_tokens(tokens, center, radius=160)
+                return ("OF", 0.05, center, ctx)
+            # NEW: Special chars are valid!
+            if re.fullmatch(r"[-_]+|\.[-_]+", v):
+                if br_rev_labels and any(distance((t.x, t.y), (r.x, r.y)) <= 100 for r in br_rev_labels):
+                    return (v, 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
         return None
 
-    # Demote single letters if hyphen codes exist
     any_hyphen = any(re.fullmatch(r"\d{1,2}-\d{1,2}", v) for _, v, _ in cands)
     if any_hyphen:
         cands = [(s - (6.0 if re.fullmatch(r"[A-Z]", v) else 0.0), v, xy) for (s, v, xy) in cands]
@@ -338,14 +368,10 @@ def score_candidates_bottom_right_first(
     best = max(cands, key=lambda c: c[0])
     score, v, center = best
     ctx = context_snippet_from_tokens(tokens, center, radius=160)
-    
-    if is_dot_letter(v):
-        LOG.info(f"  ✓ Extracted dot+letter: {v}")
-    
     return (v, score, center, ctx)
 
-def score_candidates_global(tokens: List[Token], page_w: float, page_h: float) -> Optional[Tuple[str, float, Tuple[float, float], str]]:
-    """Global fallback. Returns tuple or None."""
+def score_candidates_global(tokens: List[Token], page_w: float, page_h: float):
+    """ORIGINAL GLOBAL - UNCHANGED"""
     anchor_tokens = [t for t in tokens if norm_val(t.text).upper() in TITLE_ANCHORS]
     rev_tokens = [t for t in tokens if REV_TOKEN_RE.match(norm_val(t.text))]
     if not rev_tokens:
@@ -360,8 +386,7 @@ def score_candidates_global(tokens: List[Token], page_w: float, page_h: float) -
         is_revision_word = r_word.startswith("revision")
         neighborhood = [t for t in tokens if distance((t.x, t.y), (r.x, r.y)) <= 280]
         
-        nearby = [t for t in tokens if distance((t.x, t.y), (r.x, r.y)) <= 350]
-        table_header_count = sum(1 for t in nearby if norm_val(t.text).upper() in REV_TABLE_HEADERS)
+        table_header_count = count_revision_table_headers_nearby((r.x, r.y), tokens, radius=350)
         is_likely_revision_table = table_header_count >= 2
         
         for t in neighborhood:
@@ -369,95 +394,109 @@ def score_candidates_global(tokens: List[Token], page_w: float, page_h: float) -
             if not REV_VALUE_RE.match(v):
                 continue
             if is_in_revision_table(t, tokens, page_w, page_h):
+                LOG.debug(f"Skipping '{v}' in global pass - detected in revision table")
                 continue
             
             d = distance((t.x, t.y), (r.x, r.y)) + 1e-3
             same_line = abs(t.y - r.y) <= max(r.h, t.h) * 0.8
             to_right = t.x > r.x
+            base = 1000.0 / d
             
-            score = 1000.0 / d
-            if same_line:
-                score += 8.0
-            if to_right:
-                score += 6.0
-            score += nearby_anchor_bonus((t.x, t.y)) * 1.5
+            if same_line: base += 4.0
+            if to_right:  base += 6.0
+            if in_bottom_right(t.x, t.y, page_w, page_h): base += 5.0
+            base += nearby_anchor_bonus((t.x, t.y)) * 1.5
+            if t.conf is not None: base += (t.conf - 0.5) * 2.0
             
-            if is_likely_revision_table or is_revision_word:
-                score *= 0.1
-            if in_bottom_right(t.x, t.y, page_w, page_h):
-                score += 4.0
+            if is_revision_word: base -= 4.0
+            if is_likely_revision_table: base -= 20.0
             
-            cands.append((score, v, (t.x, t.y)))
+            cands.append((base, v, (t.x, t.y)))
 
     if not cands:
         return None
 
-    best = max(cands, key=lambda c: c[0])
-    score, v, center = best
+    br_cands = [c for c in cands if in_bottom_right(c[2][0], c[2][1], page_w, page_h)]
+    pool = br_cands if br_cands else cands
+    
+    score, v, center = max(pool, key=lambda c: c[0])
     ctx = context_snippet_from_tokens(tokens, center, radius=160)
     return (v, score, center, ctx)
 
-# ----------------------------- Page Analysis ------------------------------------
+# ----------------------------- Multi-Corner (NEW FOR ROTATIONS) ----------------
 
 def analyze_page_native(
     pdf_path: Path, page_index0: int, brx: float, bry: float, blocklist: set, edge_margin: float
 ) -> Optional[Tuple[str, str, float, str]]:
-    """Returns (engine, value, score, context) or None"""
+    """
+    NEW: Multi-corner support for rotated drawings.
+    Order: br → bl → tl → tr
+    """
     native = get_native_tokens(pdf_path, page_index0)
     with fitz.open(pdf_path) as doc:
         pw, ph = doc[page_index0].rect.width, doc[page_index0].rect.height
 
-    # Try all corners
-    if native.tokens:
-        best_suspicious = None
-        for corner in ("br", "bl", "tr", "tl"):
-            # Determine ROI
-            if corner == "br":
-                roi_tokens = [t for t in native.tokens if in_bottom_right_strict(t.x, t.y, pw, ph, brx, bry)]
-            elif corner == "bl":
-                left_w = pw * (1.0 - brx)
-                roi_tokens = [t for t in native.tokens if t.x <= left_w and t.y >= ph * bry]
-            elif corner == "tr":
-                top_h = ph * (1.0 - bry)
-                roi_tokens = [t for t in native.tokens if t.x >= pw * brx and t.y <= top_h]
-            else:  # tl
-                left_w = pw * (1.0 - brx)
-                top_h = ph * (1.0 - bry)
-                roi_tokens = [t for t in native.tokens if t.x <= left_w and t.y <= top_h]
-            
-            if not roi_tokens:
-                continue
-            
-            res = score_candidates_bottom_right_first(roi_tokens, pw, ph, 0.0, 0.0, blocklist, edge_margin)
-            if not res:
-                continue
-            
-            v, score, _, ctx = res
-            if not is_suspicious_rev_value(v) and is_plausible_rev_value(v):
-                return (f"native_{corner}", canonicalize_rev_value(v), score, ctx)
-            if best_suspicious is None or score > best_suspicious[2]:
-                best_suspicious = (f"native_{corner}", canonicalize_rev_value(v), score, ctx)
+    best_suspicious = None
+    
+    # Try corners: bottom-right, bottom-left, top-left, top-right
+    for corner in ["br", "bl", "tl", "tr"]:
+        if corner == "br":
+            roi_tokens = [t for t in native.tokens if in_bottom_right_strict(t.x, t.y, pw, ph, brx, bry)]
+        elif corner == "bl":
+            roi_tokens = [t for t in native.tokens if in_bottom_left_strict(t.x, t.y, pw, ph, brx, bry)]
+        elif corner == "tl":
+            roi_tokens = [t for t in native.tokens if in_top_left_strict(t.x, t.y, pw, ph, brx, bry)]
+        else:  # tr
+            roi_tokens = [t for t in native.tokens if in_top_right_strict(t.x, t.y, pw, ph, brx, bry)]
         
-        if best_suspicious:
-            return best_suspicious
+        if not roi_tokens:
+            continue
+        
+        res = score_candidates_bottom_right_first(roi_tokens, pw, ph, 0.0, 0.0, blocklist, edge_margin)
+        if not res:
+            continue
+        
+        v, score, _, ctx = res
+        
+        # Check plausibility
+        if not is_suspicious_rev_value(v) and is_plausible_rev_value(v):
+            if corner != "br":
+                LOG.info(f"  Found in {corner.upper()}: {v}")
+            return (f"native_{corner}", v, score, ctx)
+        
+        if best_suspicious is None or score > best_suspicious[2]:
+            best_suspicious = (f"native_{corner}", v, score, ctx)
+    
+    if best_suspicious:
+        return best_suspicious
 
     # Global fallback
     if native.tokens:
         res = score_candidates_global(native.tokens, pw, ph)
         if res:
             v, score, _, ctx = res
-            return ("native_global", canonicalize_rev_value(v), score, ctx)
+            return ("native", v, score, ctx)
+
+    # Text fallback
+    if native.text:
+        m = re.search(r"(?i)\brev(?:ision)?\b\s*[:#\-]?\s*([A-Za-z]{1,2}|\d{1,2}-\d{1,2})\b", native.text)
+        if m:
+            return ("native_text", norm_val(m.group(1)), 0.3, native.text[:80])
 
     return None
 
-# ----------------------------- File Processing ----------------------------------
+# ----------------------------- File Processing (ORIGINAL + notes) --------------
+
+def _normalize_output_value(v: str) -> str:
+    vu = norm_val(v).upper()
+    if vu == "OF":
+        return "EMPTY"
+    return norm_val(v)
 
 def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, edge_margin: float) -> Optional[RevHit]:
-    """Process all pages, return best REV hit."""
     hits: Dict[int, RevHit] = {}
     with fitz.open(pdf_path) as d:
         n = len(d)
-    
     for i in range(n):
         res = analyze_page_native(pdf_path, i, brx, bry, blocklist, edge_margin)
         if not res:
@@ -466,93 +505,87 @@ def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, e
         page_no = i + 1
         prev = hits.get(page_no)
         if not prev or score > prev.score:
-            hits[page_no] = RevHit(
-                file=pdf_path.name,
-                page=page_no,
-                value=value,
-                engine=engine,
-                score=score,
-                context_snippet=ctx,
-                notes=""
-            )
-    
+            hits[page_no] = RevHit(file=pdf_path.name, page=page_no, value=value,
+                                   engine=engine, score=score, context_snippet=ctx, notes="")
     if not hits:
         return None
-    
-    best = max(hits.values(), key=lambda h: h.score)
+    best = max(hits.values(), key=lambda h: getattr(h, 'score', 0))
     return best
 
-# ----------------------------- Main ---------------------------------------------
-
-def main():
-    """Standalone CLI."""
-    p = argparse.ArgumentParser(description="REV Extractor - Properly Fixed Scoring")
-    p.add_argument("input_folder", type=Path)
-    p.add_argument("-o", "--output", type=Path, default=Path("rev_results_fixed.csv"))
-    p.add_argument("--brx", type=float, default=DEFAULT_BR_X)
-    p.add_argument("--bry", type=float, default=DEFAULT_BR_Y)
-    p.add_argument("--edge-margin", type=float, default=DEFAULT_EDGE_MARGIN)
-    args = p.parse_args()
-
-    pdfs = sorted(args.input_folder.glob("*.pdf"))
-    if not pdfs:
-        LOG.warning(f"No PDFs in {args.input_folder}")
-        return
-
-    LOG.info(f"Processing {len(pdfs)} PDFs")
-
-    blocklist = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"}
-    rows = []
-    stats = {"native": 0, "failed": 0, "dot_letter": 0, "special_char": 0}
-
-    for pdf_path in tqdm(pdfs, desc="Processing"):
+def iter_pdfs(folder: Path) -> Iterable[Path]:
+    seen = set()
+    for p in folder.iterdir():
         try:
-            result = process_pdf_native(pdf_path, args.brx, args.bry, blocklist, args.edge_margin)
-            
-            if result and result.value != "NO_REV":
-                stats["native"] += 1
-                
-                if re.fullmatch(r"\.[A-Z]{1,2}", result.value) or re.fullmatch(r"[A-Z]{1,2}\.", result.value):
-                    stats["dot_letter"] += 1
-                
-                if re.fullmatch(r"[-_]+|\.[-_]+", result.value):
-                    stats["special_char"] += 1
-                
-                rows.append({
-                    "file": result.file,
-                    "value": result.value,
-                    "engine": result.engine,
-                    "score": f"{result.score:.2f}",
-                    "context": result.context_snippet
-                })
+            if p.is_file() and p.suffix.lower() == ".pdf":
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    yield p
+        except Exception:
+            continue
+
+def run_pipeline(input_folder: Path, output_csv: Path,
+                 brx: float, bry: float, rev_2l_blocklist: set,
+                 edge_margin: float) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    pdfs = list(iter_pdfs(input_folder))
+    if not pdfs:
+        LOG.warning(f"No PDFs found in {input_folder}")
+
+    for p in tqdm(pdfs, desc="Scanning PDFs"):
+        try:
+            native_best = process_pdf_native(p, brx, bry, rev_2l_blocklist, edge_margin)
+
+            if native_best:
+                value = _normalize_output_value(native_best.value)
+                rows.append({"file": p.name, "value": value, "engine": native_best.engine})
             else:
-                stats["failed"] += 1
-                rows.append({
-                    "file": pdf_path.name,
-                    "value": "NO_REV",
-                    "engine": "failed",
-                    "score": "0",
-                    "context": ""
-                })
+                rows.append({"file": p.name, "value": "", "engine": ""})
 
         except Exception as e:
-            LOG.error(f"Failed {pdf_path.name}: {e}")
-            stats["failed"] += 1
+            LOG.warning(f"Failed {p.name}: {e}")
+            rows.append({"file": p.name, "value": "", "engine": ""})
 
     # Write CSV
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, 'w', newline='', encoding='utf-8-sig') as f:
-        writer = csv.DictWriter(f, fieldnames=['file', 'value', 'engine', 'score', 'context'])
-        writer.writeheader()
-        writer.writerows(rows)
+    try:
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        with open(output_csv, 'w', newline='', encoding='utf-8-sig') as outf:
+            writer = csv.writer(outf)
+            writer.writerow(['file', 'value', 'engine'])
+            for r in rows:
+                fs = _scalarize(r.get('file', ''))
+                vs = _scalarize(r.get('value', ''))
+                es = _scalarize(r.get('engine', ''))
+                writer.writerow([fs, vs, es])
+        LOG.info(f"Wrote CSV to {output_csv.resolve()} with {len(rows)} rows")
+    except Exception as e:
+        LOG.error(f"Failed to write CSV: {e}")
 
-    LOG.info(f"\n{'='*60}")
-    LOG.info(f"Results: {args.output}")
-    LOG.info(f"Total: {len(rows)} | Native: {stats['native']} | Failed: {stats['failed']}")
-    LOG.info(f"Dot+letter: {stats['dot_letter']} | Special chars: {stats['special_char']}")
-    LOG.info(f"Success Rate: {stats['native']/len(pdfs)*100:.1f}%")
-    LOG.info(f"{'='*60}\n")
+    return rows
 
+def parse_args(argv=None):
+    a = argparse.ArgumentParser(description="Extract REV values (enhanced).")
+    a.add_argument("input_folder", type=Path)
+    a.add_argument("-o","--output", type=Path, default=Path("rev_results.csv"))
+    a.add_argument("--br-x", type=float, default=DEFAULT_BR_X)
+    a.add_argument("--br-y", type=float, default=DEFAULT_BR_Y)
+    a.add_argument("--edge-margin", type=float, default=DEFAULT_EDGE_MARGIN)
+    a.add_argument("--rev-2l-blocklist", type=str,
+                   default=",".join(sorted(DEFAULT_REV_2L_BLOCKLIST)))
+    return a.parse_args(argv)
+
+def main(argv=None):
+    args = parse_args(argv)
+    blocklist = {s.strip().upper() for s in args.rev_2l_blocklist.split(",") if s.strip()}
+    return run_pipeline(
+        input_folder=args.input_folder,
+        output_csv=args.output,
+        brx=args.br_x,
+        bry=args.br_y,
+        rev_2l_blocklist=blocklist,
+        edge_margin=args.edge_margin
+    )
 
 if __name__ == "__main__":
     main()

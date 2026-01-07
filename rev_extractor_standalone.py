@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — Simplified Version (No SIZE Filtering)
-Trusts pattern matching + REV label proximity without aggressive SIZE exclusion
+REV Extractor — Improved Robust Version
+Fixed bugs, enhanced dot+letter detection, better validation
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ try:
 except ImportError:
     AZURE_AVAILABLE = False
 
-LOG = logging.getLogger("rev_extractor_simple")
+LOG = logging.getLogger("rev_extractor_improved")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
 # ----------------------------- VALIDATION FRAMEWORK ----------------------------
@@ -34,34 +34,41 @@ class ReviewFlag(Enum):
     BOTH_ENGINES_DISAGREE = "both_engines_disagree"
     BOTH_ENGINES_INVALID = "both_engines_invalid"
 
-# Special valid REV markers (expanded)
+# Special valid REV markers
 SPECIAL_VALID_REVS = {
     "-", ".-", "_", "._", "__", "___", "----", "–", "—",
-    ". .", ". -", "- .", ". _", "_ .", ".E", ".F", ".A", ".B"
+    ". .", ". -", "- .", ". _", "_ ."
 }
 
-# Patterns
+# Pattern for dot+letter combinations (like .E, .F, .A)
 DOT_LETTER_PATTERN = re.compile(r"^\.+[A-Z]{1,2}$", re.IGNORECASE)
-DOT_NUMERIC_PATTERN = re.compile(r"^\.+\d{1,2}-\d{1,2}$", re.IGNORECASE)
-UNDERSCORE_PATTERN = re.compile(r"^_+$")  # Pure underscores
+
+# Pattern for letter+dot combinations (like E., F., AA.)
+LETTER_DOT_PATTERN = re.compile(r"^[A-Z]{1,2}\.+$", re.IGNORECASE)
+
+def normalize_special_rev(value: str) -> str:
+    """Normalize special REV for comparison."""
+    if not value:
+        return value
+    v = value.strip().replace(" ", "")
+    if all(c in "-._–— " for c in value):
+        return value
+    return value
 
 def is_special_valid_rev(value: str) -> bool:
     """Check if value is a special valid REV marker."""
     if not value:
         return False
-    # Pure special chars (-, _, .)
+    # Pure special characters (-, _, etc.)
     if all(c in "-._–— " for c in value):
         return True
-    # Dot+letter
+    # Dot+letter combinations (.E, .F, .AA)
     if DOT_LETTER_PATTERN.match(value):
         return True
-    # Dot+numeric
-    if DOT_NUMERIC_PATTERN.match(value):
+    # Letter+dot combinations (E., F., AA.)
+    if LETTER_DOT_PATTERN.match(value):
         return True
-    # Underscore
-    if UNDERSCORE_PATTERN.match(value):
-        return True
-    return value in SPECIAL_VALID_REVS
+    return normalize_special_rev(value) in SPECIAL_VALID_REVS
 
 def is_valid_numeric_rev(value: str) -> Tuple[bool, Optional[str]]:
     """Validate numeric REV: X-Y where Y should be 0."""
@@ -71,18 +78,28 @@ def is_valid_numeric_rev(value: str) -> Tuple[bool, Optional[str]]:
         return True, None
     major, minor = match.groups()
     if int(minor) != 0:
-        return False, f"Numeric REV {value} has non-zero minor version"
+        return False, f"Numeric REV {value} has non-zero minor version (should be X-0)"
     return True, None
 
 def is_valid_double_letter_rev(value: str) -> Tuple[bool, Optional[str]]:
-    """Validate double letter REV: first letter should be A/B/C."""
+    """
+    Validate double letter REV: first letter should be A/B/C.
+    Exception: Dot+letter and letter+dot combinations are exempt from this rule.
+    """
     if not value or len(value) != 2:
         return True, None
+    
+    # Skip validation for dot+letter combinations
+    if DOT_LETTER_PATTERN.match(value) or LETTER_DOT_PATTERN.match(value):
+        return True, None
+    
     if not value.isalpha():
         return True, None
+    
     first_letter = value[0].upper()
     if first_letter not in ('A', 'B', 'C'):
-        return False, f"Double letter REV {value} starts with {first_letter}"
+        return False, f"Double letter REV {value} starts with {first_letter} (should start with A/B/C)"
+    
     return True, None
 
 def is_single_numeric_only(value: str) -> bool:
@@ -98,7 +115,7 @@ def validate_rev_value(value: str, engine: str) -> Tuple[bool, Optional[ReviewFl
         return True, None, None
     
     if is_single_numeric_only(value):
-        return False, ReviewFlag.SINGLE_NUMERIC_ONLY, f"Single numeric {value}"
+        return False, ReviewFlag.SINGLE_NUMERIC_ONLY, f"Single numeric {value} without hyphen"
     
     valid_numeric, numeric_reason = is_valid_numeric_rev(value)
     if not valid_numeric:
@@ -132,27 +149,27 @@ class Token:
 
 # ----------------------------- NATIVE EXTRACTION -------------------------------
 
-# Comprehensive REV pattern (all formats)
+# Enhanced REV pattern - comprehensive coverage of all formats
 REV_VALUE_RE = re.compile(
     r"^(?:"
-    r"[A-Z]{1,2}|"                    # Letters: A, AB
-    r"\d{1,2}-\d{1,2}|"               # Numeric: 1-0, 2-0
-    r"\.+[A-Z]{1,2}|"                 # Dot+letter: .E, .F
-    r"\.+\d{1,2}-\d{1,2}|"            # Dot+numeric: .1-0
-    r"[A-Z]{1,2}\.+|"                 # Letter+dot: E.
-    r"[-._]{1,4}|"                    # Special: -, _, .-, ._
-    r"_+|"                            # Pure underscores: _, __
-    r"-+"                             # Pure dashes: -, --
+    r"[A-Z]{1,2}|"                    # Single/double letters: A, B, AA, AB
+    r"\d{1,3}-\d{1,2}|"               # Numeric hyphenated: 1-0, 2-0, 3-0
+    r"\.+[A-Z]{1,2}|"                 # Dot+letter(s): .E, .F, ..A, .AA
+    r"\.+\d{1,3}-\d{1,2}|"            # Dot+numeric: .1-0, .2-0
+    r"[A-Z]{1,2}\.+|"                 # Letter(s)+dot: A., E., AA.
+    r"\d{1,3}-\d{1,2}\.+|"            # Numeric+dot: 1-0., 2-0.
+    r"[-._–—]{1,4}"                   # Pure special markers: -, _, .-, etc.
     r")$",
     re.IGNORECASE
 )
 
 REV_TOKEN_RE = re.compile(r"^rev\.?$", re.IGNORECASE)
+SIZE_TOKEN_RE = re.compile(r"^size\.?$", re.IGNORECASE)
 
-TITLE_ANCHORS = {"DWG", "DWG.", "DWGNO", "SHEET", "SCALE", "WEIGHT", "DRAWN", "CHECKED"}
+TITLE_ANCHORS = {"DWG", "DWG.", "DWGNO", "SHEET", "SCALE", "WEIGHT", "SIZE", "DRAWN", "CHECKED"}
 REV_TABLE_HEADERS = {
     "REVISIONS", "REVISION", "DESCRIPTION", "DESCRIPTIONS",
-    "EC", "DFT", "APPR", "APPD", "DATE", "CHKD",
+    "EC", "DFT", "APPR", "APPD", "DATE", "CHKD", "DRAWN",
     "CHECKED", "APPROVED", "DRAWING", "CHANGE", "ECN"
 }
 DEFAULT_BLOCKLIST = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"}
@@ -166,10 +183,11 @@ def norm_val(v: Any) -> str:
     return s
 
 def distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Calculate Euclidean distance between two points."""
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 def get_native_tokens(pdf_path: Path, page_idx: int, corner: str = "br") -> Tuple[List[Token], float, float]:
-    """Extract tokens from specific corner."""
+    """Extract tokens from specific corner of PDF."""
     tokens: List[Token] = []
     
     with fitz.open(pdf_path) as doc:
@@ -177,6 +195,7 @@ def get_native_tokens(pdf_path: Path, page_idx: int, corner: str = "br") -> Tupl
         rect = page.rect
         page_w, page_h = rect.width, rect.height
         
+        # Define corner crop region
         if corner == "br":
             crop = fitz.Rect(page_w * 0.5, page_h * 0.5, page_w, page_h)
         elif corner == "bl":
@@ -188,6 +207,7 @@ def get_native_tokens(pdf_path: Path, page_idx: int, corner: str = "br") -> Tupl
         else:
             crop = rect
         
+        # Extract words from crop region
         words = page.get_text("words", clip=crop)
         
         for x0, y0, x1, y1, txt, *_ in words:
@@ -201,12 +221,34 @@ def get_native_tokens(pdf_path: Path, page_idx: int, corner: str = "br") -> Tupl
     return tokens, page_w, page_h
 
 def is_in_revision_table(token: Token, all_tokens: List[Token], page_w: float, page_h: float) -> bool:
-    """Detect if token is in revision table."""
+    """Detect if token is in revision table (top area with table headers)."""
+    # If in bottom half, less likely to be in rev table
     if token.y > page_h * 0.5:
         return False
+    
+    # Count revision table headers nearby
     nearby = [t for t in all_tokens if distance((t.x, t.y), (token.x, token.y)) <= 350]
     table_header_count = sum(1 for t in nearby if norm_val(t.text).upper() in REV_TABLE_HEADERS)
+    
     return table_header_count >= 2
+
+def is_likely_dimension(value: str, tokens: List[Token], token: Token) -> bool:
+    """
+    Check if a numeric value is likely a dimension rather than a REV.
+    Dimensions often have nearby measurement context.
+    """
+    if not re.match(r"^\d+-\d+$", value):
+        return False
+    
+    # Check for nearby dimension-like tokens
+    nearby = [t for t in tokens if distance((t.x, t.y), (token.x, token.y)) <= 100]
+    dimension_indicators = {"HOLE", "DIA", "DEPTH", "LENGTH", "WIDTH", "HEIGHT", "THK", "THICK"}
+    
+    for t in nearby:
+        if any(ind in norm_val(t.text).upper() for ind in dimension_indicators):
+            return True
+    
+    return False
 
 def extract_native_pymupdf_corner(
     pdf_path: Path,
@@ -214,10 +256,8 @@ def extract_native_pymupdf_corner(
     page_idx: int = 0
 ) -> Optional[RevResult]:
     """
-    Extract REV using SIMPLE approach:
-    - Pattern matching
-    - REV label proximity
-    - NO SIZE filtering (removed)
+    Extract REV from specific corner using PyMuPDF.
+    Enhanced with better dot+letter recognition and SIZE field distinction.
     """
     try:
         tokens, page_w, page_h = get_native_tokens(pdf_path, page_idx, corner)
@@ -225,70 +265,88 @@ def extract_native_pymupdf_corner(
         if not tokens:
             return None
         
-        # Find REV labels
+        # Find REV and SIZE labels
         rev_labels = [t for t in tokens if REV_TOKEN_RE.match(norm_val(t.text))]
+        size_labels = [t for t in tokens if SIZE_TOKEN_RE.match(norm_val(t.text))]
         
-        # Find anchors
+        # Look for anchor words (title block indicators)
         anchors = [t for t in tokens if norm_val(t.text).upper() in TITLE_ANCHORS]
         has_anchors = len(anchors) > 0
         
+        # If no anchors found, might not be valid title block
         if not has_anchors and corner != "br":
             return None
         
         candidates = []
         
-        # Strategy 1: Look near REV labels (primary strategy)
+        # Strategy 1: Look near REV labels (highest priority)
         if rev_labels:
             for rev_label in rev_labels:
-                # Wider radius to catch underscores that might be further away
+                # Find tokens near REV label
                 nearby = [t for t in tokens 
-                         if distance((t.x, t.y), (rev_label.x, rev_label.y)) <= 250]
+                         if distance((t.x, t.y), (rev_label.x, rev_label.y)) <= 200]
                 
                 for t in nearby:
                     v = norm_val(t.text)
                     
-                    # Must match REV pattern
+                    # Check if it matches REV pattern
                     if not REV_VALUE_RE.match(v):
                         continue
                     
-                    # Skip revision table entries
+                    # Skip if in revision table
                     if is_in_revision_table(t, tokens, page_w, page_h):
                         continue
                     
-                    # Skip blocklist (but NOT special chars or dot+letter)
-                    if not is_special_valid_rev(v) and not DOT_LETTER_PATTERN.match(v) and v.upper() in DEFAULT_BLOCKLIST:
+                    # Skip if near SIZE label (but not if it's dot+letter format)
+                    if not (DOT_LETTER_PATTERN.match(v) or LETTER_DOT_PATTERN.match(v)):
+                        near_size = any(distance((t.x, t.y), (s.x, s.y)) <= 80 
+                                      for s in size_labels)
+                        if near_size:
+                            continue
+                    
+                    # Skip if likely a dimension
+                    if is_likely_dimension(v, tokens, t):
                         continue
                     
-                    # Calculate score based on proximity to REV label
+                    # Skip blocklist (but NOT special markers or dot+letter)
+                    if not is_special_valid_rev(v) and v.upper() in DEFAULT_BLOCKLIST:
+                        continue
+                    
+                    # Calculate score
                     dist = distance((t.x, t.y), (rev_label.x, rev_label.y))
-                    score = 1000.0 / (dist + 1.0)
+                    score = 150.0 / (dist + 1.0)  # Higher base score for REV label proximity
                     
-                    # HUGE BOOST for special characters (_, -, etc.)
-                    if is_special_valid_rev(v):
-                        score += 200.0  # Massive boost
-                        LOG.debug(f"Special char '{v}' - applying +200 boost (score now {score:.1f})")
+                    # MAJOR BOOST: Dot+letter combinations (very common REV format)
+                    if DOT_LETTER_PATTERN.match(v):
+                        score += 100.0  # Strong boost for .E, .F, etc.
+                        LOG.debug(f"  Dot+letter REV candidate: {v} (score: {score:.1f})")
                     
-                    # HUGE BOOST for dot+letter (.E, .F)
-                    elif DOT_LETTER_PATTERN.match(v):
-                        score += 150.0
-                        LOG.debug(f"Dot+letter '{v}' - applying +150 boost (score now {score:.1f})")
+                    # BOOST: Letter+dot combinations
+                    if LETTER_DOT_PATTERN.match(v):
+                        score += 80.0
                     
                     # Bonus for same line as REV label
-                    if abs(t.y - rev_label.y) <= max(t.h, rev_label.h) * 0.9:
+                    if abs(t.y - rev_label.y) <= max(t.h, rev_label.h) * 0.8:
                         score += 30.0
                     
                     # Bonus for being to the right of REV label
                     if t.x > rev_label.x:
-                        score += 20.0
+                        score += 15.0
                     
                     # Bonus for anchor words nearby
                     anchor_count = sum(1 for a in anchors 
                                      if distance((t.x, t.y), (a.x, a.y)) <= 200)
-                    score += anchor_count * 5.0
+                    score += anchor_count * 10.0
                     
-                    candidates.append((score, v, f"{corner.upper()}: {dist:.0f}px from REV, {anchor_count} anchors"))
+                    # Penalty for being near SIZE label (unless dot+letter)
+                    if not (DOT_LETTER_PATTERN.match(v) or LETTER_DOT_PATTERN.match(v)):
+                        min_size_dist = min((distance((t.x, t.y), (s.x, s.y)) for s in size_labels), default=999)
+                        if min_size_dist < 100:
+                            score -= 50.0
+                    
+                    candidates.append((score, v, f"{corner.upper()}: Near REV label, {anchor_count} anchors"))
         
-        # Strategy 2: Look standalone near anchors (no REV label)
+        # Strategy 2: Look for standalone values near anchors (no explicit REV label)
         else:
             for t in tokens:
                 v = norm_val(t.text)
@@ -299,21 +357,40 @@ def extract_native_pymupdf_corner(
                 if is_in_revision_table(t, tokens, page_w, page_h):
                     continue
                 
-                if not is_special_valid_rev(v) and not DOT_LETTER_PATTERN.match(v) and v.upper() in DEFAULT_BLOCKLIST:
+                # Skip if near SIZE label (but not if it's dot+letter format)
+                if not (DOT_LETTER_PATTERN.match(v) or LETTER_DOT_PATTERN.match(v)):
+                    near_size = any(distance((t.x, t.y), (s.x, s.y)) <= 80 
+                                  for s in size_labels)
+                    if near_size:
+                        continue
+                
+                # Skip if likely a dimension
+                if is_likely_dimension(v, tokens, t):
                     continue
                 
-                # Score based on anchors
+                if not is_special_valid_rev(v) and v.upper() in DEFAULT_BLOCKLIST:
+                    continue
+                
+                # Score based on anchor proximity
                 anchor_count = sum(1 for a in anchors 
                                  if distance((t.x, t.y), (a.x, a.y)) <= 200)
                 
                 if anchor_count > 0:
                     score = anchor_count * 15.0
                     
-                    # Boosts for special formats
-                    if is_special_valid_rev(v):
-                        score += 200.0
-                    elif DOT_LETTER_PATTERN.match(v):
-                        score += 150.0
+                    # MAJOR BOOST: Dot+letter combinations
+                    if DOT_LETTER_PATTERN.match(v):
+                        score += 100.0
+                        LOG.debug(f"  Dot+letter REV candidate (no label): {v} (score: {score:.1f})")
+                    
+                    # BOOST: Letter+dot combinations
+                    if LETTER_DOT_PATTERN.match(v):
+                        score += 80.0
+                    
+                    # Penalty for being near SIZE label
+                    min_size_dist = min((distance((t.x, t.y), (s.x, s.y)) for s in size_labels), default=999)
+                    if min_size_dist < 100:
+                        score -= 40.0
                     
                     candidates.append((score, v, f"{corner.upper()}: Near {anchor_count} anchors"))
         
@@ -323,13 +400,15 @@ def extract_native_pymupdf_corner(
         # Choose best candidate
         best_score, best_value, notes = max(candidates, key=lambda x: x[0])
         
-        LOG.info(f"  {pdf_path.name} ({corner.upper()}): Found '{best_value}' (score={best_score:.1f}) - {notes}")
+        # Log if we found a dot+letter value
+        if DOT_LETTER_PATTERN.match(best_value):
+            LOG.info(f"  ✓ Dot+letter REV found: {best_value} in {pdf_path.name}")
         
         return RevResult(
             file=pdf_path.name,
             value=best_value,
             engine=f"pymupdf_{corner}",
-            confidence="high" if best_score > 100 else "medium",
+            confidence="high" if best_score > 80 else ("medium" if best_score > 40 else "low"),
             notes=notes
         )
         
@@ -343,6 +422,7 @@ def extract_native_multi_corner(pdf_path: Path) -> Optional[RevResult]:
         result = extract_native_pymupdf_corner(pdf_path, corner=corner)
         
         if result and result.value and result.value != "NO_REV":
+            # Validate the result
             is_valid, flag, reason = validate_rev_value(result.value, "pymupdf")
             
             if is_valid:
@@ -359,67 +439,95 @@ GPT_SYSTEM_PROMPT = """You are an expert at analyzing engineering drawings and e
 YOUR TASK:
 Extract the REV (revision) value from the title block of this engineering drawing.
 
-VALID REV FORMATS (all equally valid):
+CRITICAL: REV VALUE FORMATS
 
-1. SPECIAL CHARACTERS (VERY COMMON):
-   - Single dash: -
-   - Single underscore: _ (common!)
-   - Multiple: __, ___, ---
+1. SPECIAL MARKERS (VALID):
+   - Single or multiple dashes: -, --, ---
+   - Underscores: _, __, ___
    - Combinations: .-, ._, -., _.
-   → Return these EXACTLY as shown!
+   - These are VALID REV markers meaning "no revision yet" or "initial"
+   → If you see these in the REV field, return them EXACTLY as shown
 
-2. DOT+LETTER (VERY COMMON):
-   - .E, .F, .A, .B, .C
-   - ..A, ...E
-   → Include the dot in your response!
+2. LETTER REVISIONS (COMMON):
+   - Single: A, B, C, D, E, F, ... Z
+   - Double: AA, AE, BA, BC, BP, CE
+   - **Dot+letter: .A, .B, .E, .F, .Z** ← VERY IMPORTANT! Common format!
+   - **Letter+dot: A., E., F.** ← Also valid!
+   - Examples: ".E" means revision E, ".F" means revision F
+   → The dot is PART of the REV value - include it!
 
 3. NUMERIC REVISIONS:
-   - 1-0, 2-0, 3-0 (second number usually 0)
-   - .1-0, .2-0 (dot + numeric)
+   - Format: [number]-[number]
+   - Common: 1-0, 2-0, 3-0, 9-0, 12-0
+   - With dots: .1-0, .2-0, 1-0., 2-0.
+   - The second number is USUALLY 0
+   - If you see 5-40, 18-8, 8-32, these might be dimensions (not REV)
+   → Only return numeric values that are clearly in the REV field
 
-4. LETTER REVISIONS:
-   - A, B, C, D, E, F
-   - AA, AB, BA, BC
+4. NO REV:
+   - Use ONLY if NO REV field exists OR field is truly empty
+   - Don't use if there's a special marker (-, _, etc.)
+   - Don't use if there's a dot+letter (.E, .F)
 
-5. NO REV:
-   - Only if NO REV field exists or field is empty
+CRITICAL: DISTINGUISH REV FROM SIZE
+Many drawings have both SIZE and REV fields:
+- SIZE: Usually a single letter (A, B, C, D) indicating drawing size
+- REV: The revision value (could be .E, .F, etc.)
+→ Look for the field labeled "REV" or "REV:" - NOT the SIZE field!
 
-TITLE BLOCK LOCATION:
+TITLE BLOCK IDENTIFICATION:
 - Check BOTTOM-RIGHT, BOTTOM-LEFT, TOP-RIGHT, TOP-LEFT
-- Contains: DWG NO, SHEET, SCALE, REV
+- Contains: DWG NO, SHEET, SCALE, SIZE, **REV**, company logo
+- REV field is separate from SIZE field
 
-CRITICAL EXAMPLES:
-
-Example 1 - UNDERSCORE (common):
-"Drawing Number: 22468 | Rev: _ | Sheet 1"
-✅ Correct: {"rev_value": "_", "notes": "Underscore REV marker"}
-❌ WRONG: {"rev_value": "D"} ← Don't confuse with other letters!
-
-Example 2 - UNDERSCORE:
-"Drawing Number: 22620 | Rev: _ | Sheet 1"
-✅ Correct: {"rev_value": "_", "notes": "Underscore REV marker"}
-❌ WRONG: {"rev_value": "E"} ← This is NOT the REV!
-
-Example 3 - DOT+LETTER:
-"DWG NO: EA-13855 | REV: .E"
-✅ Correct: {"rev_value": ".E", "notes": "Dot+letter REV"}
-
-Example 4 - DASH:
-"REV: - | SHEET 1"
-✅ Correct: {"rev_value": "-", "notes": "Dash REV marker"}
+AVOID:
+- SIZE values (A, B, C, D near "SIZE:" label)
+- Revision history tables (with dates/descriptions)
+- Grid letters on edges
+- Section markers (SECTION C-C)
+- Dimensions (5-40, 18-8 are likely NOT REVs)
 
 RESPONSE FORMAT:
 {
-  "rev_value": "_",
+  "rev_value": ".E",
   "confidence": "high",
-  "location": "bottom-right, REV field",
-  "notes": "Underscore REV marker in REV field"
+  "location": "bottom-right title block, REV field",
+  "notes": "Dot+letter REV .E, distinct from SIZE value"
 }
 
+EXAMPLES:
+
+Example 1 - Dot+letter (VERY COMMON):
+"SIZE: B | DWG NO: EA-13855 | REV: .E | SHEET 1"
+✅ {"rev_value": ".E", "notes": "Dot+letter REV .E (not SIZE B)"}
+❌ Wrong: {"rev_value": "B"} ← This is the SIZE, not REV!
+
+Example 2 - Another dot+letter:
+"SIZE: A | DWG NO: EA-10840 | REV: .F"
+✅ {"rev_value": ".F", "notes": "Dot+letter REV .F (not SIZE A)"}
+❌ Wrong: {"rev_value": "A"} ← This is the SIZE, not REV!
+
+Example 3 - Letter+dot:
+"REV: E. | SCALE 1:1"
+✅ {"rev_value": "E.", "notes": "Letter+dot REV E."}
+
+Example 4 - Plain letter:
+"REV: E | SHEET 1"
+✅ {"rev_value": "E", "notes": "Plain letter REV E"}
+
+Example 5 - Numeric with dot:
+"REV: .2-0"
+✅ {"rev_value": ".2-0", "notes": "Dot+numeric REV .2-0"}
+
+Example 6 - Special marker:
+"DWG NO: 22468 | REV: - | SHEET 1"
+✅ {"rev_value": "-", "notes": "Special REV marker (dash)"}
+
 REMEMBER:
-- Special characters (_, -, .-, ._) are VALID and COMMON
-- Look for the "REV:" label specifically
-- Return EXACTLY what you see (including dots, underscores, dashes)
+- Dot+letter (.E, .F, .A, .Z) is a VALID and COMMON REV format!
+- Letter+dot (E., F., A.) is also VALID!
+- Always check the "REV:" label - NOT the "SIZE:" label!
+- Include the dot in your response if it's part of the REV value
 """
 
 class AzureGPTExtractor:
@@ -475,7 +583,7 @@ class AzureGPTExtractor:
                         "content": [
                             {
                                 "type": "text",
-                                "text": f"Extract REV from {corner.upper()} corner. Special characters (_, -, .-, ._) and dot+letter (.E, .F) are VERY COMMON - return them exactly!"
+                                "text": f"Extract REV from {corner.upper()} corner. CRITICAL: Look for 'REV:' label (NOT 'SIZE:' label). Dot+letter (.E, .F, .Z) is VERY COMMON - include the dot! Special markers (-, _) are also VALID."
                             },
                             {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                         ]
@@ -487,6 +595,7 @@ class AzureGPTExtractor:
             
             result_text = response.choices[0].message.content or ""
             
+            # Parse JSON
             json_match = re.search(r'```json\s*(\{.*?\})\s*```', result_text, re.DOTALL | re.IGNORECASE)
             if json_match:
                 result_text = json_match.group(1)
@@ -499,6 +608,10 @@ class AzureGPTExtractor:
             
             if value.upper() in {"NO_REV", "EMPTY", "N/A", "NA"}:
                 value = "NO_REV"
+            
+            # Log if GPT found a dot+letter value
+            if DOT_LETTER_PATTERN.match(value):
+                LOG.info(f"  ✓ GPT found dot+letter REV: {value} in {pdf_path.name}")
             
             return RevResult(
                 file=pdf_path.name,
@@ -517,15 +630,17 @@ class AzureGPTExtractor:
 def smart_extraction(pdf_path: Path, gpt: AzureGPTExtractor) -> RevResult:
     """Smart extraction with validation and rerun logic."""
     
-    # Try native multi-corner
+    # Step 1: Try native multi-corner
     native_result = extract_native_multi_corner(pdf_path)
     
     if native_result and native_result.value and native_result.value != "NO_REV":
+        # Validate
         is_valid, flag, reason = validate_rev_value(native_result.value, "pymupdf")
         
         if is_valid:
             return native_result
         else:
+            # Suspicious - rerun with GPT
             LOG.info(f"  Native returned suspicious '{native_result.value}': {reason}")
             LOG.info(f"  Rerunning with GPT...")
             
@@ -537,13 +652,15 @@ def smart_extraction(pdf_path: Path, gpt: AzureGPTExtractor) -> RevResult:
             gpt_valid, gpt_flag, gpt_reason = validate_rev_value(gpt_result.value, "gpt")
             
             if gpt_valid:
-                gpt_result.notes = f"Native={native_result.value}, GPT corrected"
+                gpt_result.notes = f"Native={native_result.value} ({reason}), GPT corrected to {gpt_result.value}"
                 return gpt_result
             elif native_result.value == gpt_result.value:
+                # Both agree on suspicious value
                 native_result.review_flag = flag or ReviewFlag.BOTH_ENGINES_DISAGREE
                 native_result.validation_note = f"REVIEW: {reason}"
                 return native_result
             else:
+                # Both different invalid
                 return RevResult(
                     file=pdf_path.name,
                     value=native_result.value,
@@ -551,10 +668,10 @@ def smart_extraction(pdf_path: Path, gpt: AzureGPTExtractor) -> RevResult:
                     confidence="low",
                     notes=f"Native={native_result.value}, GPT={gpt_result.value}",
                     review_flag=ReviewFlag.BOTH_ENGINES_INVALID,
-                    validation_note=f"REVIEW: {reason}"
+                    validation_note=f"REVIEW: {reason} | GPT: {gpt_reason}"
                 )
     
-    # Native failed - use GPT
+    # Step 2: Native failed - use GPT multi-corner
     LOG.info(f"→ GPT: {pdf_path.name}")
     
     for corner in ["br", "bl", "tl", "tr"]:
@@ -583,7 +700,7 @@ def run_pipeline(
     azure_key: str,
     deployment_name: str = "gpt-4.1"
 ) -> List[Dict[str, Any]]:
-    """Simplified pipeline without SIZE filtering."""
+    """Fully standalone robust pipeline."""
     rows: List[Dict[str, Any]] = []
     
     LOG.info("Initializing GPT...")
@@ -596,7 +713,13 @@ def run_pipeline(
     
     LOG.info(f"Processing {len(pdfs)} PDFs")
     
-    stats = {"native": 0, "gpt": 0, "failed": 0, "flagged": 0}
+    stats = {
+        "native": 0, 
+        "gpt": 0, 
+        "failed": 0, 
+        "flagged": 0,
+        "dot_letter": 0  # Track dot+letter detections
+    }
     
     for pdf_path in tqdm(pdfs, desc="Processing"):
         try:
@@ -608,6 +731,10 @@ def run_pipeline(
                 stats["gpt"] += 1
             if result.review_flag != ReviewFlag.NONE:
                 stats["flagged"] += 1
+            
+            # Track dot+letter format detections
+            if DOT_LETTER_PATTERN.match(result.value) or LETTER_DOT_PATTERN.match(result.value):
+                stats["dot_letter"] += 1
             
             rows.append({
                 "file": result.file,
@@ -644,7 +771,7 @@ def run_pipeline(
     LOG.info(f"\n{'='*60}")
     LOG.info(f"Results: {output_csv}")
     LOG.info(f"Total: {len(rows)} | Native: {stats['native']} | GPT: {stats['gpt']}")
-    LOG.info(f"Flagged: {stats['flagged']} | Failed: {stats['failed']}")
+    LOG.info(f"Dot+letter formats: {stats['dot_letter']} | Flagged: {stats['flagged']} | Failed: {stats['failed']}")
     LOG.info(f"Cost: ${stats['gpt'] * 0.01:.2f}")
     LOG.info(f"{'='*60}\n")
     
@@ -653,9 +780,9 @@ def run_pipeline(
 def main():
     start = time.time()
     
-    p = argparse.ArgumentParser(description="Simplified REV Extractor (No SIZE Filtering)")
+    p = argparse.ArgumentParser(description="Improved Robust REV Extractor")
     p.add_argument("input_folder", type=Path)
-    p.add_argument("-o", "--output", type=Path, default=Path("rev_results_final.csv"))
+    p.add_argument("-o", "--output", type=Path, default=Path("rev_results_improved.csv"))
     p.add_argument("--azure-endpoint", default=os.getenv("AZURE_OPENAI_ENDPOINT"))
     p.add_argument("--azure-key", default=os.getenv("AZURE_OPENAI_KEY"))
     p.add_argument("--deployment-name", default="gpt-4.1")

@@ -1,548 +1,608 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — Enhanced PyMuPDF + Azure GPT-4 with Validation
-Handles edge cases: invalid numerics, double letters, single numerics, special chars
+REV Extractor — Enhanced with Edge Case Handling
+Based on proven rev_extractor_fixed.py with SURGICAL additions for ~300/4500 edge cases
 """
 
 from __future__ import annotations
-import argparse, base64, csv, logging, os, re, json
+import argparse, logging, re, math, csv
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
-import time
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import fitz  # PyMuPDF
 from tqdm import tqdm
 
-# Import validation from enhanced fixed script
-try:
-    from rev_extractor_fixed import (
-        process_pdf_native, _normalize_output_value,
-        is_plausible_rev_value, is_suspicious_rev_value, canonicalize_rev_value,
-        DEFAULT_BR_X, DEFAULT_BR_Y, DEFAULT_EDGE_MARGIN, DEFAULT_REV_2L_BLOCKLIST
-    )
-    NATIVE_AVAILABLE = True
-except ImportError:
-    NATIVE_AVAILABLE = False
-    LOG.warning("Could not import rev_extractor_fixed - native extraction disabled")
-
-# Azure OpenAI SDK
-try:
-    from openai import AzureOpenAI
-    AZURE_AVAILABLE = True
-except ImportError:
-    AZURE_AVAILABLE = False
-
-LOG = logging.getLogger("rev_extractor_enhanced")
+LOG = logging.getLogger("rev_extractor_fixed")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-# ---------------------------------------------------------------------
-# ENHANCED GPT SYSTEM PROMPT (with special character support)
-# ---------------------------------------------------------------------
-GPT_SYSTEM_PROMPT = """You are an expert at analyzing engineering drawings and extracting revision information.
+# ----------------------------- Patterns & Constants -----------------------------
 
-YOUR TASK:
-Extract the REV (revision) value from the title block of this engineering drawing.
+# ENHANCED: Added special characters (-, _, .-, ._, etc.)
+REV_VALUE_RE = re.compile(
+    r"^(?:"
+    r"[A-Z]{1,2}|"              # A, B, AA, AB
+    r"\d{1,3}-\d{1,3}|"         # 1-0, 2-0, 5-40
+    r"-+|_+|"                   # -, __, ___
+    r"\.-+|\._+"                # .-, ._
+    r")$"
+)
 
-CRITICAL RULES:
+def canonicalize_rev_value(v: str) -> str:
+    """Canonicalise REV values."""
+    s = norm_val(v)
+    if s in {"", "NO_REV", "NONE", "N/A"}:
+        return "NO_REV"
+    # Normalize special characters
+    if re.fullmatch(r"-{1,}", s):
+        return "-"
+    if re.fullmatch(r"_{1,}", s):
+        return "_"
+    if re.fullmatch(r"\.-{1,}", s):
+        return ".-"
+    if re.fullmatch(r"\._{1,}", s):
+        return "._"
+    return s
 
-1. Title Block Location:
-   - The REV value is in the TITLE BLOCK, typically in the BOTTOM-RIGHT corner
-   - Title blocks contain: DWG NO, SHEET, SCALE, DRAWN BY, CHECKED BY, APPROVED BY
-   - Usually has company logo/name (ROTORK, FAIRCHILD, etc.)
+def is_plausible_rev_value(v: str) -> bool:
+    """
+    NEW: Domain validation rules for edge cases.
+    Returns True if valid, False if suspicious.
+    """
+    s = canonicalize_rev_value(v)
+    
+    if s == "NO_REV":
+        return True
+    
+    # Special characters ARE valid (-, _, .-, etc.)
+    if s in {"-", "_", ".-", "._"}:
+        return True
+    
+    # Single/double letters
+    if re.fullmatch(r"[A-Z]{1,2}", s):
+        if len(s) == 2:
+            # Double letters: first letter should be A, B, or C
+            return s[0] in {"A", "B", "C"}
+        return True
+    
+    # Numeric hyphenated: should end with -0
+    m = re.fullmatch(r"(\d{1,3})-(\d{1,3})", s)
+    if m:
+        return m.group(2) == "0"  # Must be X-0 format
+    
+    return False
 
-2. Avoid These Common Mistakes:
-   - DO NOT extract from REVISION TABLES (top-right, shows history: REV A | DATE | DESCRIPTION)
-   - DO NOT extract grid reference letters (A, B, C along edges)
-   - DO NOT extract part numbers or item callouts
-   - DO NOT extract section markers (e.g., "SECTION C-C")
+def is_suspicious_rev_value(v: str) -> bool:
+    """NEW: Check if value needs verification."""
+    s = norm_val(v)
+    
+    # Single numeric only (1, 2, 202) is highly unlikely
+    if re.fullmatch(r"\d{1,4}", s):
+        return True
+    
+    # Rotation tokens
+    if s.upper() in {"LTR", "RTL"}:
+        return True
+    
+    s2 = canonicalize_rev_value(s)
+    return bool(REV_VALUE_RE.fullmatch(s2) and not is_plausible_rev_value(s2))
 
-3. REV Value Formats (in STRICT priority order):
-
-   NUMERIC REVISIONS:
-   - Format: X-0 only (e.g., 1-0, 2-0, 3-0, 12-0)
-   - NEVER return X-Y where Y is not zero (5-40, 18-8 are INVALID)
-
-   LETTER REVISIONS:
-   - Single letter: A, B, C, ... Z
-   - Double letters MUST start with A, B, or C: AA, AB, BA, BC, CE
-   - NEVER return double letters starting with D or higher (DE, DF, FF are INVALID)
-
-   SPECIAL CHARACTERS (VALID for empty/no revision):
-   - Single dash: -
-   - Single underscore: _
-   - Dash with dot: .-
-   - Underscore with dot: ._
-   - Multiple underscores: __, ___
-   - These indicate "no revision" or "not applicable"
-
-   INVALID FORMATS TO AVOID:
-   - Single/multiple bare numbers (1, 2, 202) - INVALID
-   - Non-zero hyphenated (5-40, 18-8) - INVALID
-   - Double letters D+ (DE, DF, FF) - INVALID
-
-4. Validation Checklist:
-   - Is it in the title block (bottom corner)?
-   - Is there a "REV:" or "REV" label nearby?
-   - Does it follow a VALID format?
-   - If numeric, does it end with -0?
-   - If double letter, does it start with A, B, or C?
-
-RESPONSE FORMAT:
-Return ONLY a JSON object like:
-{
-  "rev_value": "2-0",
-  "confidence": "high",
-  "location": "bottom-right title block",
-  "notes": "Clear numeric REV 2-0 ending in zero"
+REV_TOKEN_RE = re.compile(r"^rev\.?$", re.IGNORECASE)
+TITLE_ANCHORS = {"DWG", "DWG.", "DWGNO", "SHEET", "SCALE", "WEIGHT", "SIZE", "TITLE", "DRAWN", "CHECKED"}
+REV_TABLE_HEADERS = {
+    "REVISIONS", "REVISION", "DESCRIPTION", "DESCRIPTIONS",
+    "EC", "DFT", "APPR", "APPD", "DATE", "CHKD", "DRAWN",
+    "CHECKED", "APPROVED", "DRAWING", "CHANGE", "ECN"
 }
 
-OR for special characters:
-{
-  "rev_value": "-",
-  "confidence": "high",
-  "location": "bottom-right title block",
-  "notes": "Dash indicates no revision"
-}"""
+DEFAULT_BR_X = 0.68
+DEFAULT_BR_Y = 0.72
+DEFAULT_EDGE_MARGIN = 0.018
+DEFAULT_REV_2L_BLOCKLIST = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"}
 
-# ---------------------------------------------------------------------
-# DATA CLASSES
-# ---------------------------------------------------------------------
+# ----------------------------- Data Structures ---------------------------------
+
 @dataclass
-class RevResult:
+class Token:
+    text: str
+    conf: Optional[float]
+    x: float
+    y: float
+    w: float
+    h: float
+
+@dataclass
+class PageResult:
+    tokens: List[Token]
+    text: str
+    engine: str
+
+@dataclass
+class RevHit:
     file: str
+    page: int
     value: str
     engine: str
-    confidence: str = "unknown"
+    score: float
+    context_snippet: str
     notes: str = ""
-    human_review: bool = False
-    review_reason: str = ""
 
-# ---------------------------------------------------------------------
-# NATIVE EXTRACTION (Enhanced with validation)
-# ---------------------------------------------------------------------
-def extract_native_pymupdf(pdf_path: Path) -> Optional[RevResult]:
-    """Try native PyMuPDF extraction."""
-    if not NATIVE_AVAILABLE:
+# ----------------------------- Utilities (ORIGINAL) ----------------------------
+
+def _scalarize(v: Any):
+    if isinstance(v, (list, tuple, set)):
+        return ", ".join(map(str, v))
+    if isinstance(v, dict):
+        return ", ".join(f"{k}={str(vv)}" for k, vv in v.items())
+    if isinstance(v, (bytes, bytearray)):
+        return v.decode("utf-8", errors="ignore")
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    return str(v)
+
+def norm_val(v: Any) -> str:
+    if v is None:
+        return ""
+    s = str(v).replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def in_bottom_right(x: float, y: float, width: float, height: float) -> bool:
+    return x > width * 0.55 and y > height * 0.60
+
+def in_bottom_right_strict(x: float, y: float, width: float, height: float, brx: float, bry: float) -> bool:
+    return x >= width * brx and y >= height * bry
+
+def in_bottom_left_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    left_w = w * (1.0 - brx)
+    return x <= left_w and y >= h * bry
+
+def in_top_right_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    top_h = h * (1.0 - bry)
+    return x >= w * brx and y <= top_h
+
+def in_top_left_strict(x: float, y: float, w: float, h: float, brx: float, bry: float) -> bool:
+    left_w = w * (1.0 - brx)
+    top_h = h * (1.0 - bry)
+    return x <= left_w and y <= top_h
+
+def in_top_half(y: float, height: float) -> bool:
+    return y < height * 0.5
+
+def is_far_from_edges(x: float, y: float, width: float, height: float, edge_margin: float) -> bool:
+    xm = width * edge_margin
+    ym = height * edge_margin
+    return (x > xm) and (x < width - xm) and (y > ym) and (y < height - ym)
+
+def distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    return math.hypot(a[0] - b[0], a[1] - b[1])
+
+def context_snippet_from_tokens(tokens: List[Token], center: Tuple[float, float], radius: float = 160) -> str:
+    close = [t.text for t in tokens if distance((t.x, t.y), center) <= radius]
+    s = " ".join(close)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s[:80]
+
+# ----------------------------- Native Tokenization (ORIGINAL) ------------------
+
+def get_native_tokens(pdf_path: Path, page_index0: int) -> PageResult:
+    tokens: List[Token] = []
+    text_parts: List[str] = []
+    with fitz.open(pdf_path) as doc:
+        page = doc[page_index0]
+        for x0, y0, x1, y1, txt, *_ in page.get_text("words"):
+            txt_clean = txt.strip()
+            if not txt_clean:
+                continue
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            tokens.append(Token(text=txt_clean, conf=None, x=cx, y=cy, w=(x1-x0), h=(y1-y0)))
+            text_parts.append(txt_clean)
+    return PageResult(tokens=tokens, text=" ".join(text_parts), engine="native")
+
+# ----------------------------- Revision Table Detection (ORIGINAL) -------------
+
+def is_in_revision_table(token: Token, all_tokens: List[Token], page_w: float, page_h: float) -> bool:
+    if in_bottom_right_strict(token.x, token.y, page_w, page_h, 0.68, 0.72):
+        return False
+    if not in_top_half(token.y, page_h):
+        return False
+    nearby = [t for t in all_tokens if distance((t.x, t.y), (token.x, token.y)) <= 400]
+    table_header_count = sum(1 for t in nearby if norm_val(t.text).upper() in REV_TABLE_HEADERS)
+    if table_header_count >= 3:
+        return True
+    if table_header_count >= 2 and token.x > page_w * 0.5:
+        return True
+    return False
+
+def count_revision_table_headers_nearby(center_xy: Tuple[float, float], all_tokens: List[Token], radius: float = 350) -> int:
+    return sum(1 for t in all_tokens 
+               if distance((t.x, t.y), center_xy) <= radius 
+               and norm_val(t.text).upper() in REV_TABLE_HEADERS)
+
+# ----------------------------- Candidate Assembly (ORIGINAL) -------------------
+
+def _sort_by_x(tokens: List[Token]) -> List[Token]:
+    return sorted(tokens, key=lambda t: (t.y, t.x))
+
+def assemble_inline_candidates(neighborhood: List[Token], line_tol: float = 0.85, gap_tol: float = 0.60) -> List[str]:
+    if not neighborhood:
+        return []
+    by_lines: List[List[Token]] = []
+    toks = _sort_by_x(neighborhood)
+    for t in toks:
+        placed = False
+        for line in by_lines:
+            anchor = line[0]
+            same_line = abs(t.y - anchor.y) <= max(anchor.h, t.h) * line_tol
+            if same_line:
+                line.append(t); placed = True; break
+        if not placed:
+            by_lines.append([t])
+
+    cands: set = set()
+    for line in by_lines:
+        line = sorted(line, key=lambda t: t.x)
+        if not line:
+            continue
+        avg_h = sum(t.h for t in line) / len(line)
+        max_gap = avg_h * gap_tol
+        texts = [norm_val(t.text) for t in line]
+        xs = [t.x for t in line]
+        for i in range(len(line)-1):
+            if abs(xs[i+1] - xs[i]) <= max_gap:
+                cands.add(texts[i] + texts[i+1])
+        for i in range(len(line)-2):
+            if abs(xs[i+1] - xs[i]) <= max_gap and abs(xs[i+2] - xs[i+1]) <= max_gap:
+                cands.add(texts[i] + texts[i+1] + texts[i+2])
+    return list(cands)
+
+# ----------------------------- Scoring (ORIGINAL PRESERVED) --------------------
+
+def _nearby_anchor_bonus(tokens_in_zone: List[Token], center_xy: Tuple[float, float], radius=220) -> int:
+    return sum(1 for a in tokens_in_zone
+               if norm_val(a.text).upper() in TITLE_ANCHORS and distance((a.x, a.y), center_xy) <= radius)
+
+def score_candidates_bottom_right_first(
+    tokens: List[Token], page_w: float, page_h: float,
+    brx: float, bry: float, blocklist: Optional[set] = None,
+    edge_margin: float = DEFAULT_EDGE_MARGIN
+):
+    """ORIGINAL SCORING - UNCHANGED"""
+    block = {t.upper() for t in (blocklist or set())}
+
+    br_tokens = [
+        t for t in tokens
+        if in_bottom_right_strict(t.x, t.y, page_w, page_h, brx, bry)
+        and is_far_from_edges(t.x, t.y, page_w, page_h, edge_margin)
+    ]
+    if not br_tokens:
         return None
-        
-    try:
-        best = process_pdf_native(
-            pdf_path,
-            brx=DEFAULT_BR_X,
-            bry=DEFAULT_BR_Y,
-            blocklist=DEFAULT_REV_2L_BLOCKLIST,
-            edge_margin=DEFAULT_EDGE_MARGIN
-        )
-        
-        if best and best.value:
-            value = _normalize_output_value(best.value)
-            
-            # Check if suspicious
-            is_suspicious = is_suspicious_rev_value(value)
-            is_plausible = is_plausible_rev_value(value)
-            
-            return RevResult(
-                file=pdf_path.name,
-                value=value,
-                engine=f"pymupdf_{best.engine}",
-                confidence="high" if best.score > 100 and is_plausible else "medium",
-                notes=best.context_snippet,
-                human_review=is_suspicious or not is_plausible,
-                review_reason="suspicious_value" if is_suspicious else ("implausible_value" if not is_plausible else "")
-            )
-        return None
-    except Exception as e:
-        LOG.debug(f"Native extraction failed for {pdf_path.name}: {e}")
-        return None
 
-# ---------------------------------------------------------------------
-# GPT EXTRACTOR (Enhanced)
-# ---------------------------------------------------------------------
-class AzureGPTExtractor:
-    def __init__(self, endpoint: str, api_key: str, deployment_name: str = "gpt-4.1"):
-        if not AZURE_AVAILABLE:
-            raise ImportError("openai not installed. Run: pip install openai")
-        
-        endpoint = endpoint.rstrip('/')
-        if '/openai/deployments' in endpoint:
-            endpoint = endpoint.split('/openai/deployments')[0]
-        
-        LOG.info(f"Initializing GPT client with endpoint: {endpoint}")
-        
-        try:
-            self.client = AzureOpenAI(
-                api_key=api_key,
-                api_version="2024-02-15-preview",
-                azure_endpoint=endpoint
-            )
-            self.deployment_name = deployment_name
-            LOG.info("✓ GPT client initialized successfully")
-        except Exception as e:
-            LOG.error(f"Failed to initialize GPT client: {e}")
-            raise
-    
-    def pdf_to_base64_image(self, pdf_path: Path, page_idx: int = 0, dpi: int = 150) -> str:
-        """Convert PDF page to base64-encoded PNG (focused on title block)."""
-        with fitz.open(pdf_path) as doc:
-            page = doc[page_idx]
-            rect = page.rect
-            # Crop to bottom-right quarter
-            crop = fitz.Rect(
-                rect.x0 + rect.width * 0.5,
-                rect.y0 + rect.height * 0.5,
-                rect.x1,
-                rect.y1,
-            )
-            zoom = dpi / 72.0
-            mat = fitz.Matrix(zoom, zoom)
-            pix = page.get_pixmap(matrix=mat, alpha=False, clip=crop)
-            png_bytes = pix.tobytes("png")
-            return base64.b64encode(png_bytes).decode('utf-8')
+    br_rev_labels = [t for t in br_tokens if REV_TOKEN_RE.match(norm_val(t.text))]
 
-    def extract_rev(self, pdf_path: Path) -> RevResult:
-        """Extract REV using GPT-4 Vision with validation."""
-        try:
-            LOG.debug(f"Converting {pdf_path.name} to image...")
-            img_base64 = self.pdf_to_base64_image(pdf_path)
-            
-            LOG.debug(f"Sending to GPT API...")
-            response = self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=[
-                    {"role": "system", "content": GPT_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": (
-                                    "Extract the REV value from this engineering drawing. "
-                                    "Focus on the TITLE BLOCK. Follow validation rules strictly. "
-                                    "Return ONLY the JSON object."
-                                )
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/png;base64,{img_base64}"}
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=500,
-                temperature=0
-            )
-            
-            result_text = response.choices[0].message.content or ""
-            LOG.debug(f"GPT response: {result_text[:200]}...")
-            
-            # Parse JSON
-            json_match = re.search(r'```json\s*(\{.*?\})\s*```', result_text, re.DOTALL | re.IGNORECASE)
-            if json_match:
-                result_text = json_match.group(1)
-            
-            result_data = json.loads(result_text.strip())
-            
-            raw_value = result_data.get("rev_value", "")
-            value = canonicalize_rev_value(raw_value)
-            confidence = (result_data.get("confidence") or "unknown").lower()
-            notes = (result_data.get("notes") or "").strip()
-            
-            # Normalize NO_REV -> EMPTY
-            if value == "NO_REV":
-                value = "EMPTY"
-            
-            # Validate result
-            is_plausible = is_plausible_rev_value(value)
-            is_suspicious = is_suspicious_rev_value(value)
-            
-            return RevResult(
-                file=pdf_path.name,
-                value=value,
-                engine="gpt_vision",
-                confidence=confidence,
-                notes=notes[:100],
-                human_review=is_suspicious or not is_plausible,
-                review_reason="suspicious_value" if is_suspicious else ("implausible_value" if not is_plausible else "")
-            )
-            
-        except Exception as e:
-            LOG.error(f"GPT extraction failed for {pdf_path.name}: {e}")
-            return RevResult(
-                file=pdf_path.name,
-                value="",
-                engine="gpt_failed",
-                confidence="none",
-                notes=str(e)[:100],
-                human_review=True,
-                review_reason="gpt_error"
-            )
+    def is_hyphen_code(s: str) -> bool:
+        return bool(re.fullmatch(r"\d{1,2}-\d{1,2}", s))
+    def is_double_letter(s: str) -> bool:
+        return bool(re.fullmatch(r"[A-Z]{2}", s))
+    def is_single_letter(s: str) -> bool:
+        return bool(re.fullmatch(r"[A-Z]", s))
+    def is_special_char(s: str) -> bool:
+        """Check if value is special character (-, _, etc.)"""
+        return bool(re.fullmatch(r"[-_]+|\.[-_]+", s))
 
-# ---------------------------------------------------------------------
-# COMPARISON LOGIC
-# ---------------------------------------------------------------------
-def compare_and_decide(
-    native_result: Optional[RevResult],
-    gpt_result: RevResult,
-    pdf_path: Path
-) -> RevResult:
-    """
-    Compare PyMuPDF and GPT results, choose the best one.
-    
-    Priority:
-    1. Both valid and agree → Use PyMuPDF (higher confidence)
-    2. One valid, one invalid → Use valid one
-    3. Both valid but disagree → Use higher confidence
-    4. Both invalid → Flag for human review
-    """
-    
-    # No native result → use GPT
-    if not native_result:
-        return gpt_result
-    
-    native_val = native_result.value
-    gpt_val = gpt_result.value
-    
-    native_plausible = is_plausible_rev_value(native_val)
-    gpt_plausible = is_plausible_rev_value(gpt_val)
-    
-    # Both agree
-    if native_val == gpt_val:
-        return RevResult(
-            file=pdf_path.name,
-            value=native_val,
-            engine="pymupdf+gpt_agree",
-            confidence="high",
-            notes=f"Both engines agree: {native_val}",
-            human_review=False,
-            review_reason=""
-        )
-    
-    # Both valid
-    if native_plausible and gpt_plausible:
-        # Choose higher confidence
-        if native_result.confidence == "high":
-            return RevResult(
-                file=pdf_path.name,
-                value=native_val,
-                engine="pymupdf+gpt_differ",
-                confidence="medium",
-                notes=f"Chose PyMuPDF {native_val} over GPT {gpt_val} (higher conf)",
-                human_review=True,
-                review_reason="engines_disagree"
-            )
-        else:
-            return RevResult(
-                file=pdf_path.name,
-                value=gpt_val,
-                engine="gpt+pymupdf_differ",
-                confidence="medium",
-                notes=f"Chose GPT {gpt_val} over PyMuPDF {native_val} (higher conf)",
-                human_review=True,
-                review_reason="engines_disagree"
-            )
-    
-    # One valid, one invalid
-    if native_plausible and not gpt_plausible:
-        return RevResult(
-            file=pdf_path.name,
-            value=native_val,
-            engine="pymupdf_valid",
-            confidence="medium",
-            notes=f"Chose PyMuPDF {native_val} (GPT {gpt_val} invalid)",
-            human_review=False,
-            review_reason=""
-        )
-    
-    if gpt_plausible and not native_plausible:
-        return RevResult(
-            file=pdf_path.name,
-            value=gpt_val,
-            engine="gpt_valid",
-            confidence="medium",
-            notes=f"Chose GPT {gpt_val} (PyMuPDF {native_val} invalid)",
-            human_review=False,
-            review_reason=""
-        )
-    
-    # Both invalid → flag for review
-    return RevResult(
-        file=pdf_path.name,
-        value=gpt_val,  # Default to GPT
-        engine="both_invalid",
-        confidence="low",
-        notes=f"Both invalid: PyMuPDF={native_val}, GPT={gpt_val}",
-        human_review=True,
-        review_reason="both_invalid"
-    )
+    def base_score_for(v: str) -> float:
+        """
+        CRITICAL: Special characters get LOWEST score.
+        They should NEVER beat valid letters/numbers!
+        """
+        if is_hyphen_code(v):   return 40.0  # Highest priority
+        if is_double_letter(v): return 14.0
+        if is_single_letter(v): return 4.0
+        if is_special_char(v):  return 0.5   # LOWEST priority!
+        return 2.0  # Other patterns
 
-# ---------------------------------------------------------------------
-# HYBRID PIPELINE
-# ---------------------------------------------------------------------
-def run_hybrid_pipeline(
-    input_folder: Path,
-    output_csv: Path,
-    azure_endpoint: str,
-    azure_key: str,
-    deployment_name: str = "gpt-4.1",
-    disable_gpt: bool = False
-) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Enhanced hybrid pipeline with validation."""
-    rows: List[Dict[str, Any]] = []
-    
-    if not disable_gpt:
-        LOG.info("Initializing Azure GPT client...")
-        gpt = AzureGPTExtractor(azure_endpoint, azure_key, deployment_name)
+    def neighborhood_around(cx: float, cy: float, radius: float = 300.0) -> List[Token]:
+        return [t for t in br_tokens if distance((t.x, t.y), (cx, cy)) <= radius]
+
+    cands: List[Tuple[float, str, Tuple[float,float]]] = []
+
+    def consider_token_or_assembled(ref_xy: Tuple[float,float], neigh: List[Token], label_token: Optional[Token]):
+        for t in neigh:
+            v = norm_val(t.text)
+            if not REV_VALUE_RE.match(v):
+                continue
+            vu = v.upper()
+            if vu in block:
+                continue
+            if is_in_revision_table(t, tokens, page_w, page_h):
+                LOG.debug(f"Skipping '{v}' - detected in revision table")
+                continue
+            
+            # CRITICAL FIX: Skip special characters in normal scoring
+            # They will be considered separately as last resort only
+            if is_special_char(v):
+                LOG.debug(f"Skipping special char '{v}' in normal scoring")
+                continue
+            
+            d = distance((t.x, t.y), ref_xy) + 1e-3
+            score = base_score_for(v) + 1000.0 / d
+            
+            if label_token is not None:
+                if abs(t.y - label_token.y) <= max(label_token.h, t.h) * 0.8:
+                    score += 6.0
+                if t.x > label_token.x:
+                    score += 8.0
+            
+            if in_bottom_right(t.x, t.y, page_w, page_h): 
+                score += 3.0
+            
+            score += _nearby_anchor_bonus(br_tokens, (t.x, t.y)) * 1.2
+            cands.append((score, v, (t.x, t.y)))
+
+        assembled = assemble_inline_candidates(neigh, line_tol=0.85, gap_tol=0.60)
+        for s in assembled:
+            s_norm = norm_val(s)
+            if not REV_VALUE_RE.match(s_norm):
+                continue
+            if s_norm.upper() in block:
+                continue
+            score = base_score_for(s_norm) + 1000.0 / 30.0
+            if label_token is not None:
+                score += 6.0
+            cands.append((score, s_norm, ref_xy))
+
+    if br_rev_labels:
+        for r in br_rev_labels:
+            neigh = neighborhood_around(r.x, r.y, radius=300.0)
+            consider_token_or_assembled((r.x, r.y), neigh, r)
     else:
-        gpt = None
-        LOG.info("GPT disabled - using PyMuPDF only")
+        anchor_xy = (page_w * 0.92, page_h * 0.90)
+        neigh = neighborhood_around(anchor_xy[0], anchor_xy[1], radius=320.0)
+        consider_token_or_assembled(anchor_xy, neigh, None)
+
+    if not cands:
+        # No normal candidates found - NOW consider special characters and 'OF' as last resort
+        for t in br_tokens:
+            v = norm_val(t.text)
+            if v.upper() == "OF":
+                center = (t.x, t.y)
+                ctx = context_snippet_from_tokens(tokens, center, radius=160)
+                return ("OF", 0.05, center, ctx)
+            # Special chars (-, _, etc.) are valid ONLY as last resort
+            if is_special_char(v):
+                # Must be very close to REV label (within 100px)
+                if br_rev_labels and any(distance((t.x, t.y), (r.x, r.y)) <= 100 for r in br_rev_labels):
+                    LOG.info(f"  Using special char '{v}' as last resort (no other candidates)")
+                    return (v, 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
+        return None
+
+    any_hyphen = any(re.fullmatch(r"\d{1,2}-\d{1,2}", v) for _, v, _ in cands)
+    if any_hyphen:
+        cands = [(s - (6.0 if re.fullmatch(r"[A-Z]", v) else 0.0), v, xy) for (s, v, xy) in cands]
+
+    best = max(cands, key=lambda c: c[0])
+    score, v, center = best
+    ctx = context_snippet_from_tokens(tokens, center, radius=160)
+    return (v, score, center, ctx)
+
+def score_candidates_global(tokens: List[Token], page_w: float, page_h: float):
+    """ORIGINAL GLOBAL - UNCHANGED"""
+    anchor_tokens = [t for t in tokens if norm_val(t.text).upper() in TITLE_ANCHORS]
+    rev_tokens = [t for t in tokens if REV_TOKEN_RE.match(norm_val(t.text))]
+    if not rev_tokens:
+        return None
+
+    def nearby_anchor_bonus(center_xy, radius=220):
+        return sum(1 for a in anchor_tokens if distance((a.x, a.y), center_xy) <= radius)
+
+    cands = []
+    for r in rev_tokens:
+        r_word = norm_val(r.text).lower()
+        is_revision_word = r_word.startswith("revision")
+        neighborhood = [t for t in tokens if distance((t.x, t.y), (r.x, r.y)) <= 280]
+        
+        table_header_count = count_revision_table_headers_nearby((r.x, r.y), tokens, radius=350)
+        is_likely_revision_table = table_header_count >= 2
+        
+        for t in neighborhood:
+            v = norm_val(t.text)
+            if not REV_VALUE_RE.match(v):
+                continue
+            if is_in_revision_table(t, tokens, page_w, page_h):
+                LOG.debug(f"Skipping '{v}' in global pass - detected in revision table")
+                continue
+            
+            d = distance((t.x, t.y), (r.x, r.y)) + 1e-3
+            same_line = abs(t.y - r.y) <= max(r.h, t.h) * 0.8
+            to_right = t.x > r.x
+            base = 1000.0 / d
+            
+            if same_line: base += 4.0
+            if to_right:  base += 6.0
+            if in_bottom_right(t.x, t.y, page_w, page_h): base += 5.0
+            base += nearby_anchor_bonus((t.x, t.y)) * 1.5
+            if t.conf is not None: base += (t.conf - 0.5) * 2.0
+            
+            if is_revision_word: base -= 4.0
+            if is_likely_revision_table: base -= 20.0
+            
+            cands.append((base, v, (t.x, t.y)))
+
+    if not cands:
+        return None
+
+    br_cands = [c for c in cands if in_bottom_right(c[2][0], c[2][1], page_w, page_h)]
+    pool = br_cands if br_cands else cands
     
-    pdfs = list(input_folder.glob("*.pdf"))
+    score, v, center = max(pool, key=lambda c: c[0])
+    ctx = context_snippet_from_tokens(tokens, center, radius=160)
+    return (v, score, center, ctx)
+
+# ----------------------------- Multi-Corner (NEW FOR ROTATIONS) ----------------
+
+def analyze_page_native(
+    pdf_path: Path, page_index0: int, brx: float, bry: float, blocklist: set, edge_margin: float
+) -> Optional[Tuple[str, str, float, str]]:
+    """
+    NEW: Multi-corner support for rotated drawings.
+    Order: br → bl → tl → tr
+    """
+    native = get_native_tokens(pdf_path, page_index0)
+    with fitz.open(pdf_path) as doc:
+        pw, ph = doc[page_index0].rect.width, doc[page_index0].rect.height
+
+    best_suspicious = None
+    
+    # Try corners: bottom-right, bottom-left, top-left, top-right
+    for corner in ["br", "bl", "tl", "tr"]:
+        if corner == "br":
+            roi_tokens = [t for t in native.tokens if in_bottom_right_strict(t.x, t.y, pw, ph, brx, bry)]
+        elif corner == "bl":
+            roi_tokens = [t for t in native.tokens if in_bottom_left_strict(t.x, t.y, pw, ph, brx, bry)]
+        elif corner == "tl":
+            roi_tokens = [t for t in native.tokens if in_top_left_strict(t.x, t.y, pw, ph, brx, bry)]
+        else:  # tr
+            roi_tokens = [t for t in native.tokens if in_top_right_strict(t.x, t.y, pw, ph, brx, bry)]
+        
+        if not roi_tokens:
+            continue
+        
+        res = score_candidates_bottom_right_first(roi_tokens, pw, ph, 0.0, 0.0, blocklist, edge_margin)
+        if not res:
+            continue
+        
+        v, score, _, ctx = res
+        
+        # Check plausibility
+        if not is_suspicious_rev_value(v) and is_plausible_rev_value(v):
+            if corner != "br":
+                LOG.info(f"  Found in {corner.upper()}: {v}")
+            return (f"native_{corner}", v, score, ctx)
+        
+        if best_suspicious is None or score > best_suspicious[2]:
+            best_suspicious = (f"native_{corner}", v, score, ctx)
+    
+    if best_suspicious:
+        return best_suspicious
+
+    # Global fallback
+    if native.tokens:
+        res = score_candidates_global(native.tokens, pw, ph)
+        if res:
+            v, score, _, ctx = res
+            return ("native", v, score, ctx)
+
+    # Text fallback
+    if native.text:
+        m = re.search(r"(?i)\brev(?:ision)?\b\s*[:#\-]?\s*([A-Za-z]{1,2}|\d{1,2}-\d{1,2})\b", native.text)
+        if m:
+            return ("native_text", norm_val(m.group(1)), 0.3, native.text[:80])
+
+    return None
+
+# ----------------------------- File Processing (ORIGINAL + notes) --------------
+
+def _normalize_output_value(v: str) -> str:
+    vu = norm_val(v).upper()
+    if vu == "OF":
+        return "EMPTY"
+    return norm_val(v)
+
+def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, edge_margin: float) -> Optional[RevHit]:
+    hits: Dict[int, RevHit] = {}
+    with fitz.open(pdf_path) as d:
+        n = len(d)
+    for i in range(n):
+        res = analyze_page_native(pdf_path, i, brx, bry, blocklist, edge_margin)
+        if not res:
+            continue
+        engine, value, score, ctx = res
+        page_no = i + 1
+        prev = hits.get(page_no)
+        if not prev or score > prev.score:
+            hits[page_no] = RevHit(file=pdf_path.name, page=page_no, value=value,
+                                   engine=engine, score=score, context_snippet=ctx, notes="")
+    if not hits:
+        return None
+    best = max(hits.values(), key=lambda h: getattr(h, 'score', 0))
+    return best
+
+def iter_pdfs(folder: Path) -> Iterable[Path]:
+    seen = set()
+    for p in folder.iterdir():
+        try:
+            if p.is_file() and p.suffix.lower() == ".pdf":
+                rp = p.resolve()
+                if rp not in seen:
+                    seen.add(rp)
+                    yield p
+        except Exception:
+            continue
+
+def run_pipeline(input_folder: Path, output_csv: Path,
+                 brx: float, bry: float, rev_2l_blocklist: set,
+                 edge_margin: float) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    pdfs = list(iter_pdfs(input_folder))
     if not pdfs:
         LOG.warning(f"No PDFs found in {input_folder}")
-        return rows, {}
-    
-    stats = {
-        "total": len(pdfs),
-        "native_only": 0,
-        "native_suspicious": 0,
-        "gpt_used": 0,
-        "human_review": 0,
-        "both_agree": 0,
-        "both_differ": 0
-    }
-    
-    for pdf_path in tqdm(pdfs, desc="Processing PDFs"):
+
+    for p in tqdm(pdfs, desc="Scanning PDFs"):
         try:
-            # Step 1: Try PyMuPDF native
-            native_result = extract_native_pymupdf(pdf_path)
-            
-            # Step 2: Decide if GPT needed
-            needs_gpt = False
-            if not native_result or not native_result.value:
-                needs_gpt = True
-            elif native_result.human_review:
-                needs_gpt = True
-                stats["native_suspicious"] += 1
-                LOG.info(f"→ Suspicious value {native_result.value} in {pdf_path.name}, retrying with GPT")
-            
-            # Step 3: Use GPT if needed
-            if needs_gpt and not disable_gpt:
-                stats["gpt_used"] += 1
-                gpt_result = gpt.extract_rev(pdf_path)
-                final_result = compare_and_decide(native_result, gpt_result, pdf_path)
-            elif native_result:
-                final_result = native_result
-                stats["native_only"] += 1
+            native_best = process_pdf_native(p, brx, bry, rev_2l_blocklist, edge_margin)
+
+            if native_best:
+                value = _normalize_output_value(native_best.value)
+                rows.append({"file": p.name, "value": value, "engine": native_best.engine})
             else:
-                final_result = RevResult(
-                    file=pdf_path.name,
-                    value="",
-                    engine="failed",
-                    confidence="none",
-                    notes="No extraction succeeded",
-                    human_review=True,
-                    review_reason="extraction_failed"
-                )
-            
-            # Track stats
-            if final_result.human_review:
-                stats["human_review"] += 1
-            if "agree" in final_result.engine:
-                stats["both_agree"] += 1
-            elif "differ" in final_result.engine:
-                stats["both_differ"] += 1
-            
-            rows.append({
-                "file": final_result.file,
-                "value": final_result.value,
-                "engine": final_result.engine,
-                "confidence": final_result.confidence,
-                "human_review": "yes" if final_result.human_review else "no",
-                "review_reason": final_result.review_reason,
-                "notes": final_result.notes
-            })
-            
+                rows.append({"file": p.name, "value": "", "engine": ""})
+
         except Exception as e:
-            LOG.error(f"Failed {pdf_path.name}: {e}")
-            rows.append({
-                "file": pdf_path.name,
-                "value": "",
-                "engine": "error",
-                "confidence": "none",
-                "human_review": "yes",
-                "review_reason": "processing_error",
-                "notes": str(e)[:100]
-            })
-            stats["human_review"] += 1
-    
+            LOG.warning(f"Failed {p.name}: {e}")
+            rows.append({"file": p.name, "value": "", "engine": ""})
+
     # Write CSV
     try:
         output_csv.parent.mkdir(parents=True, exist_ok=True)
         with open(output_csv, 'w', newline='', encoding='utf-8-sig') as outf:
-            writer = csv.DictWriter(outf, fieldnames=[
-                'file', 'value', 'engine', 'confidence', 'human_review', 'review_reason', 'notes'
-            ])
-            writer.writeheader()
-            writer.writerows(rows)
-        
-        LOG.info(f"\n{'='*60}")
-        LOG.info(f"Results: {output_csv.resolve()}")
-        LOG.info(f"{'='*60}")
-        LOG.info(f"Total PDFs: {stats['total']}")
-        LOG.info(f"Native only: {stats['native_only']} ({stats['native_only']/stats['total']*100:.1f}%)")
-        LOG.info(f"Native suspicious (GPT retry): {stats['native_suspicious']}")
-        LOG.info(f"GPT used: {stats['gpt_used']} ({stats['gpt_used']/stats['total']*100:.1f}%)")
-        LOG.info(f"Both engines agree: {stats['both_agree']}")
-        LOG.info(f"Engines differ: {stats['both_differ']}")
-        LOG.info(f"Human review needed: {stats['human_review']} ({stats['human_review']/stats['total']*100:.1f}%)")
-        if stats['gpt_used'] > 0:
-            LOG.info(f"Estimated cost: ${stats['gpt_used'] * 0.010:.2f}")
-        LOG.info(f"{'='*60}\n")
-        
+            writer = csv.writer(outf)
+            writer.writerow(['file', 'value', 'engine'])
+            for r in rows:
+                fs = _scalarize(r.get('file', ''))
+                vs = _scalarize(r.get('value', ''))
+                es = _scalarize(r.get('engine', ''))
+                writer.writerow([fs, vs, es])
+        LOG.info(f"Wrote CSV to {output_csv.resolve()} with {len(rows)} rows")
     except Exception as e:
         LOG.error(f"Failed to write CSV: {e}")
-    
-    return rows, stats
 
-# ---------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------
+    return rows
+
 def parse_args(argv=None):
-    a = argparse.ArgumentParser(description="Enhanced PyMuPDF + GPT with validation")
+    a = argparse.ArgumentParser(description="Extract REV values (enhanced).")
     a.add_argument("input_folder", type=Path)
-    a.add_argument("-o", "--output", type=Path, default=Path("rev_results_enhanced.csv"))
-    a.add_argument("--azure-endpoint", type=str, default=os.getenv("AZURE_OPENAI_ENDPOINT"))
-    a.add_argument("--azure-key", type=str, default=os.getenv("AZURE_OPENAI_KEY"))
-    a.add_argument("--deployment-name", type=str, default="gpt-4.1")
-    a.add_argument("--disable-gpt", action="store_true", help="Use PyMuPDF only")
+    a.add_argument("-o","--output", type=Path, default=Path("rev_results.csv"))
+    a.add_argument("--br-x", type=float, default=DEFAULT_BR_X)
+    a.add_argument("--br-y", type=float, default=DEFAULT_BR_Y)
+    a.add_argument("--edge-margin", type=float, default=DEFAULT_EDGE_MARGIN)
+    a.add_argument("--rev-2l-blocklist", type=str,
+                   default=",".join(sorted(DEFAULT_REV_2L_BLOCKLIST)))
     return a.parse_args(argv)
 
 def main(argv=None):
-    start_time = time.time()
     args = parse_args(argv)
-    
-    if not args.disable_gpt and (not args.azure_endpoint or not args.azure_key):
-        LOG.error("❌ Azure credentials required (or use --disable-gpt)!")
-        return []
-    
-    results, stats = run_hybrid_pipeline(
-        args.input_folder,
-        args.output,
-        args.azure_endpoint or "",
-        args.azure_key or "",
-        args.deployment_name,
-        args.disable_gpt
+    blocklist = {s.strip().upper() for s in args.rev_2l_blocklist.split(",") if s.strip()}
+    return run_pipeline(
+        input_folder=args.input_folder,
+        output_csv=args.output,
+        brx=args.br_x,
+        bry=args.br_y,
+        rev_2l_blocklist=blocklist,
+        edge_margin=args.edge_margin
     )
-
-    end_time = time.time()
-    total_seconds = end_time - start_time
-    mins = int(total_seconds // 60)
-    secs = int(total_seconds % 60)
-    LOG.info(f"Completed in {mins}m {secs}s")
-
-    return results
 
 if __name__ == "__main__":
     main()

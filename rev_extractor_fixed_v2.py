@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-REV Extractor — Fixed Version (Compatible with rev_extractor_updated_v2_patched.py)
-Fixes critical type mismatch bug, maintains proven scoring, adds notes attribute
+REV Extractor — PROPERLY Fixed with Correct Scoring Hierarchy
+Fixes special character scoring bug that caused valid letters to be beaten by dashes
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(
 
 # ----------------------------- Patterns & Constants -----------------------------
 
-# Enhanced to support letter+dot (E., F.)
 REV_VALUE_RE = re.compile(r"^(?:[A-Z]{1,2}|\.[A-Z]{1,2}|[A-Z]{1,2}\.|\.?\d{1,3}-\d{1,3}\.?|-+|_+|\.-+|\._+)$")
 
 def canonicalize_rev_value(v: str) -> str:
@@ -44,7 +43,6 @@ def is_plausible_rev_value(v: str) -> bool:
         return True
     if s in {"-", "_", ".-", "._"}:
         return True
-    # Handle dot+letter and letter+dot
     if re.fullmatch(r"[A-Z]{1,2}", s) or re.fullmatch(r"\.[A-Z]{1,2}", s) or re.fullmatch(r"[A-Z]{1,2}\.", s):
         core = s.replace(".", "")
         if len(core) == 2:
@@ -94,16 +92,13 @@ class PageResult:
 
 @dataclass
 class RevHit:
-    """
-    Compatible with rev_extractor_updated_v2_patched.py wrapper
-    """
     file: str
     page: int
     value: str
     engine: str
     score: float
     context_snippet: str
-    notes: str = ""  # Added for wrapper compatibility
+    notes: str = ""
 
 # ----------------------------- Utilities ---------------------------------------
 
@@ -251,13 +246,21 @@ def score_candidates_bottom_right_first(
         return bool(re.fullmatch(r"[A-Z]", s))
     def is_dot_letter(s: str) -> bool:
         return bool(re.fullmatch(r"\.[A-Z]{1,2}", s) or re.fullmatch(r"[A-Z]{1,2}\.", s))
+    def is_special_char(s: str) -> bool:
+        """Check if value is special character (-, _, etc.)"""
+        return bool(re.fullmatch(r"[-_]+|\.[-_]+", s))
 
     def base_score_for(v: str) -> float:
-        if is_dot_letter(v):      return 25.0  # Boost for dot+letter
-        if is_hyphen_code(v):     return 40.0
+        """
+        CRITICAL FIX: Special characters get LOWEST score
+        They should NEVER beat valid letters/numbers
+        """
+        if is_hyphen_code(v):     return 40.0  # Highest
+        if is_dot_letter(v):      return 25.0  # Dot+letter boost
         if is_double_letter(v):   return 14.0
         if is_single_letter(v):   return 4.0
-        return 8.0
+        if is_special_char(v):    return 0.5   # CRITICAL: Lowest priority!
+        return 2.0  # Other patterns
 
     def neighborhood_around(cx: float, cy: float, radius: float = 300.0) -> List[Token]:
         return [t for t in br_tokens if distance((t.x, t.y), (cx, cy)) <= radius]
@@ -315,11 +318,19 @@ def score_candidates_bottom_right_first(
         consider_token_or_assembled(anchor_xy, neigh, None)
 
     if not cands:
+        # Last resort: check for 'OF' or special chars
         for t in br_tokens:
-            if norm_val(t.text).upper() == "OF":
+            v_upper = norm_val(t.text).upper()
+            if v_upper == "OF":
                 return ("OF", 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
+            # Only return special chars if EXPLICITLY near REV label with no other options
+            if is_special_char(norm_val(t.text)) and br_rev_labels:
+                near_rev = any(distance((t.x, t.y), (r.x, r.y)) <= 100 for r in br_rev_labels)
+                if near_rev:
+                    return (norm_val(t.text), 0.05, (t.x, t.y), context_snippet_from_tokens(tokens, (t.x, t.y)))
         return None
 
+    # Demote single letters if hyphen codes exist
     any_hyphen = any(re.fullmatch(r"\d{1,2}-\d{1,2}", v) for _, v, _ in cands)
     if any_hyphen:
         cands = [(s - (6.0 if re.fullmatch(r"[A-Z]", v) else 0.0), v, xy) for (s, v, xy) in cands]
@@ -442,10 +453,7 @@ def analyze_page_native(
 # ----------------------------- File Processing ----------------------------------
 
 def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, edge_margin: float) -> Optional[RevHit]:
-    """
-    Process all pages, return best REV hit.
-    Compatible with rev_extractor_updated_v2_patched.py wrapper.
-    """
+    """Process all pages, return best REV hit."""
     hits: Dict[int, RevHit] = {}
     with fitz.open(pdf_path) as d:
         n = len(d)
@@ -465,7 +473,7 @@ def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, e
                 engine=engine,
                 score=score,
                 context_snippet=ctx,
-                notes=""  # Empty notes for native extraction
+                notes=""
             )
     
     if not hits:
@@ -477,8 +485,8 @@ def process_pdf_native(pdf_path: Path, brx: float, bry: float, blocklist: set, e
 # ----------------------------- Main ---------------------------------------------
 
 def main():
-    """Standalone CLI - for testing without wrapper."""
-    p = argparse.ArgumentParser(description="REV Extractor - Fixed & Compatible")
+    """Standalone CLI."""
+    p = argparse.ArgumentParser(description="REV Extractor - Properly Fixed Scoring")
     p.add_argument("input_folder", type=Path)
     p.add_argument("-o", "--output", type=Path, default=Path("rev_results_fixed.csv"))
     p.add_argument("--brx", type=float, default=DEFAULT_BR_X)
@@ -495,7 +503,7 @@ def main():
 
     blocklist = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"}
     rows = []
-    stats = {"native": 0, "failed": 0, "dot_letter": 0}
+    stats = {"native": 0, "failed": 0, "dot_letter": 0, "special_char": 0}
 
     for pdf_path in tqdm(pdfs, desc="Processing"):
         try:
@@ -506,6 +514,9 @@ def main():
                 
                 if re.fullmatch(r"\.[A-Z]{1,2}", result.value) or re.fullmatch(r"[A-Z]{1,2}\.", result.value):
                     stats["dot_letter"] += 1
+                
+                if re.fullmatch(r"[-_]+|\.[-_]+", result.value):
+                    stats["special_char"] += 1
                 
                 rows.append({
                     "file": result.file,
@@ -527,13 +538,6 @@ def main():
         except Exception as e:
             LOG.error(f"Failed {pdf_path.name}: {e}")
             stats["failed"] += 1
-            rows.append({
-                "file": pdf_path.name,
-                "value": "ERROR",
-                "engine": "error",
-                "score": "0",
-                "context": str(e)[:50]
-            })
 
     # Write CSV
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -544,8 +548,8 @@ def main():
 
     LOG.info(f"\n{'='*60}")
     LOG.info(f"Results: {args.output}")
-    LOG.info(f"Total: {len(rows)} | Native Success: {stats['native']} | Failed: {stats['failed']}")
-    LOG.info(f"Dot+letter formats: {stats['dot_letter']}")
+    LOG.info(f"Total: {len(rows)} | Native: {stats['native']} | Failed: {stats['failed']}")
+    LOG.info(f"Dot+letter: {stats['dot_letter']} | Special chars: {stats['special_char']}")
     LOG.info(f"Success Rate: {stats['native']/len(pdfs)*100:.1f}%")
     LOG.info(f"{'='*60}\n")
 

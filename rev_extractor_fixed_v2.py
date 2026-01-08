@@ -46,8 +46,18 @@ DEFAULT_REV_2L_BLOCKLIST = {"EC", "DF", "DT", "AP", "ID", "NO", "IN", "ON", "BY"
 # ----------------------------- NEW: Validation Functions ------------------------
 
 def is_special_char(s: str) -> bool:
-    """Check if value is special character (-, _, .-, ._, etc.)"""
-    return bool(re.fullmatch(r"[-_]+|\.[-_]+", s))
+    """
+    Check if value is special character (-, _, .-, ._, etc.) or empty indicator.
+    These represent "no revision" or "not applicable" states.
+    """
+    s_upper = s.upper() if s else ""
+    # Direct special characters
+    if re.fullmatch(r"[-_]+|\.[-_]+", s):
+        return True
+    # Empty indicators
+    if s_upper in {"EMPTY", "NO_REV", "N/A", "NA"}:
+        return True
+    return False
 
 def canonicalize_rev_value(v: str) -> str:
     """Canonicalise REV values."""

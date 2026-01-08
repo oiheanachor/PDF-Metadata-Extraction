@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
 from tqdm import tqdm
@@ -184,8 +185,13 @@ class AzureGPTExtractor:
             LOG.error(f"Failed to initialize GPT client: {e}")
             raise
     
-    def pdf_to_base64_image(self, pdf_path: Path, page_idx: int = 0, dpi: int = 150) -> str:
-        """Convert PDF page to base64-encoded PNG (focused on title block)."""
+    def pdf_to_base64_image(self, pdf_path: Path, page_idx: int = 0, dpi: int = 100) -> str:
+        """
+        Convert PDF page to base64-encoded PNG (focused on title block).
+        
+        Uses 100 DPI for balance between quality and speed.
+        Higher DPI = better quality but slower processing and higher cost.
+        """
         with fitz.open(pdf_path) as doc:
             page = doc[page_idx]
             rect = page.rect
@@ -312,8 +318,20 @@ def compare_and_decide(
     if is_special_char(native_val):
         LOG.info(f"  Native returned special char '{native_val}', GPT returned '{gpt_val}'")
     
-    # Both agree
+    # Both agree - ALWAYS valid, even for special characters!
     if native_val == gpt_val:
+        # Special case: both agree on special char
+        if is_special_char(native_val):
+            return RevResult(
+                file=pdf_path.name,
+                value=native_val,
+                engine="pymupdf+gpt_agree",
+                confidence="high",
+                notes=f"Both engines agree: '{native_val}' (special char confirmed)",
+                human_review=False,  # ✓ No review needed when both agree!
+                review_reason=""
+            )
+        # Normal case: both agree
         return RevResult(
             file=pdf_path.name,
             value=native_val,
@@ -361,6 +379,19 @@ def compare_and_decide(
         )
     
     if gpt_plausible and not native_plausible:
+        # Special case: GPT returned special char with high confidence
+        # This means GPT visually confirmed it's truly empty/no revision
+        if is_special_char(gpt_val) and gpt_result.confidence == "high":
+            return RevResult(
+                file=pdf_path.name,
+                value=gpt_val,
+                engine="gpt_valid",
+                confidence="high",
+                notes=f"GPT confirmed special char '{gpt_val}' (no revision)",
+                human_review=False,  # ✓ No review needed for high-confidence GPT
+                review_reason=""
+            )
+        # Normal case: GPT valid, native invalid
         return RevResult(
             file=pdf_path.name,
             value=gpt_val,
@@ -372,6 +403,20 @@ def compare_and_decide(
         )
     
     # Both invalid → flag for review
+    # UNLESS both are special characters (different forms of "empty/no revision")
+    if is_special_char(native_val) and is_special_char(gpt_val):
+        # Both engines agree it's empty/no revision, just different representations
+        return RevResult(
+            file=pdf_path.name,
+            value=gpt_val,  # Prefer GPT's visual interpretation
+            engine="both_special_char",
+            confidence="medium",
+            notes=f"Both engines indicate no revision: PyMuPDF='{native_val}', GPT='{gpt_val}'",
+            human_review=False,  # ✓ No review needed
+            review_reason=""
+        )
+    
+    # Truly both invalid
     return RevResult(
         file=pdf_path.name,
         value=gpt_val,  # Default to GPT
@@ -391,9 +436,10 @@ def run_hybrid_pipeline(
     azure_endpoint: str,
     azure_key: str,
     deployment_name: str = "gpt-4.1",
-    disable_gpt: bool = False
+    disable_gpt: bool = False,
+    max_workers: int = 4  # NEW: Parallel processing
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
-    """Enhanced hybrid pipeline with validation."""
+    """Enhanced hybrid pipeline with validation and parallel processing."""
     rows: List[Dict[str, Any]] = []
     
     if not disable_gpt:
@@ -402,6 +448,7 @@ def run_hybrid_pipeline(
     else:
         gpt = None
         LOG.info("GPT disabled - using PyMuPDF only")
+        max_workers = 1  # No parallelization without GPT
     
     pdfs = list(input_folder.glob("*.pdf"))
     if not pdfs:
@@ -418,7 +465,17 @@ def run_hybrid_pipeline(
         "both_differ": 0
     }
     
-    for pdf_path in tqdm(pdfs, desc="Processing PDFs"):
+    def process_single_pdf(pdf_path: Path) -> Tuple[Dict[str, Any], Dict[str, int]]:
+        """Process a single PDF (for parallel execution)."""
+        local_stats = {
+            "native_only": 0,
+            "native_suspicious": 0,
+            "gpt_used": 0,
+            "human_review": 0,
+            "both_agree": 0,
+            "both_differ": 0
+        }
+        
         try:
             # Step 1: Try PyMuPDF native
             native_result = extract_native_pymupdf(pdf_path)
@@ -429,17 +486,17 @@ def run_hybrid_pipeline(
                 needs_gpt = True
             elif native_result.human_review:
                 needs_gpt = True
-                stats["native_suspicious"] += 1
-                LOG.info(f"→ Suspicious value {native_result.value} in {pdf_path.name}, retrying with GPT")
+                local_stats["native_suspicious"] += 1
+                LOG.debug(f"→ Suspicious value {native_result.value} in {pdf_path.name}, retrying with GPT")
             
             # Step 3: Use GPT if needed
             if needs_gpt and not disable_gpt:
-                stats["gpt_used"] += 1
+                local_stats["gpt_used"] += 1
                 gpt_result = gpt.extract_rev(pdf_path)
                 final_result = compare_and_decide(native_result, gpt_result, pdf_path)
             elif native_result:
                 final_result = native_result
-                stats["native_only"] += 1
+                local_stats["native_only"] += 1
             else:
                 final_result = RevResult(
                     file=pdf_path.name,
@@ -453,13 +510,13 @@ def run_hybrid_pipeline(
             
             # Track stats
             if final_result.human_review:
-                stats["human_review"] += 1
+                local_stats["human_review"] += 1
             if "agree" in final_result.engine:
-                stats["both_agree"] += 1
+                local_stats["both_agree"] += 1
             elif "differ" in final_result.engine:
-                stats["both_differ"] += 1
+                local_stats["both_differ"] += 1
             
-            rows.append({
+            row = {
                 "file": final_result.file,
                 "value": final_result.value,
                 "engine": final_result.engine,
@@ -467,11 +524,13 @@ def run_hybrid_pipeline(
                 "human_review": "yes" if final_result.human_review else "no",
                 "review_reason": final_result.review_reason,
                 "notes": final_result.notes
-            })
+            }
+            
+            return (row, local_stats)
             
         except Exception as e:
             LOG.error(f"Failed {pdf_path.name}: {e}")
-            rows.append({
+            row = {
                 "file": pdf_path.name,
                 "value": "",
                 "engine": "error",
@@ -479,8 +538,35 @@ def run_hybrid_pipeline(
                 "human_review": "yes",
                 "review_reason": "processing_error",
                 "notes": str(e)[:100]
-            })
-            stats["human_review"] += 1
+            }
+            local_stats["human_review"] += 1
+            return (row, local_stats)
+    
+    # Process PDFs in parallel
+    LOG.info(f"Processing {len(pdfs)} PDFs with {max_workers} workers...")
+    
+    if max_workers > 1:
+        # Parallel processing
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(process_single_pdf, pdf): pdf for pdf in pdfs}
+            
+            for future in tqdm(as_completed(futures), total=len(pdfs), desc="Processing PDFs"):
+                try:
+                    row, local_stats = future.result()
+                    rows.append(row)
+                    # Aggregate stats
+                    for key in local_stats:
+                        stats[key] += local_stats[key]
+                except Exception as e:
+                    pdf = futures[future]
+                    LOG.error(f"Future failed for {pdf.name}: {e}")
+    else:
+        # Sequential processing (for debugging)
+        for pdf_path in tqdm(pdfs, desc="Processing PDFs"):
+            row, local_stats = process_single_pdf(pdf_path)
+            rows.append(row)
+            for key in local_stats:
+                stats[key] += local_stats[key]
     
     # Write CSV
     try:
@@ -522,6 +608,8 @@ def parse_args(argv=None):
     a.add_argument("--azure-key", type=str, default=os.getenv("AZURE_OPENAI_KEY"))
     a.add_argument("--deployment-name", type=str, default="gpt-4.1")
     a.add_argument("--disable-gpt", action="store_true", help="Use PyMuPDF only")
+    a.add_argument("--max-workers", type=int, default=4, 
+                   help="Number of parallel workers (default: 4, use 1 for sequential)")
     return a.parse_args(argv)
 
 def main(argv=None):
@@ -538,7 +626,8 @@ def main(argv=None):
         args.azure_endpoint or "",
         args.azure_key or "",
         args.deployment_name,
-        args.disable_gpt
+        args.disable_gpt,
+        args.max_workers  # NEW
     )
 
     end_time = time.time()

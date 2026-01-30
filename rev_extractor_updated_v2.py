@@ -18,7 +18,7 @@ from tqdm import tqdm
 
 # Import validation from enhanced fixed script
 try:
-    from rev_extractor_fixed import (
+    from rev_extractor_fixed_v2 import (
         process_pdf_native, _normalize_output_value,
         is_plausible_rev_value, is_suspicious_rev_value, canonicalize_rev_value,
         is_special_char,  # NEW: For special character detection
@@ -608,13 +608,21 @@ def parse_args(argv=None):
     a.add_argument("--azure-key", type=str, default=os.getenv("AZURE_OPENAI_KEY"))
     a.add_argument("--deployment-name", type=str, default="gpt-4.1")
     a.add_argument("--disable-gpt", action="store_true", help="Use PyMuPDF only")
-    a.add_argument("--max-workers", type=int, default=4, 
-                   help="Number of parallel workers (default: 4, use 1 for sequential)")
+    a.add_argument("--gpt-only", action="store_true", help="Force GPT-only (disable native extractor)")
+    a.add_argument("--max-workers", type=int, default=2, 
+                   help="Number of parallel workers (default: 2, use 1 for sequential)")
     return a.parse_args(argv)
 
 def main(argv=None):
     start_time = time.time()
     args = parse_args(argv)
+    # Support a runtime "gpt-only" override: disable native extraction even if import succeeded
+    if getattr(args, 'gpt_only', False):
+        global NATIVE_AVAILABLE
+        NATIVE_AVAILABLE = False
+        # Ensure pipeline knows GPT is enabled
+        args.disable_gpt = False
+        LOG.info("GPT-only mode enabled: native extraction disabled")
     
     if not args.disable_gpt and (not args.azure_endpoint or not args.azure_key):
         LOG.error("❌ Azure credentials required (or use --disable-gpt)!")

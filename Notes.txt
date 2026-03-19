@@ -1,0 +1,36 @@
+Hi Team,
+
+I am building an internal AI-powered knowledge assistant using Azure AI Foundry that needs to index and retrieve content from SharePoint sites.
+
+To enable secure, scalable, and non-user-dependent access, I require an Azure AD App Registration with application-level permissions (service principal), rather than delegated user permissions.
+
+This is necessary for Azure AI Search to perform background indexing of SharePoint content.
+
+Please create or update an App Registration with the following:
+
+App Name:
+Foundry-SharePoint-Indexer
+
+Required Microsoft Graph Application Permissions:
+- Sites.Read.All
+- Files.Read.All
+
+Configuration required:
+- Add the above permissions as Application (not Delegated)
+- Grant Admin Consent
+- Create a Client Secret
+
+Please provide:
+- Application (Client) ID
+- Tenant ID
+- Client Secret
+
+Reason:
+This enables Azure AI Search / Foundry to securely index SharePoint content into a searchable knowledge base. It allows the system to operate independently of user sessions and ensures reliability, performance, and scalability for deployment (including Microsoft Teams integration).
+
+This is a one-time setup, with only occasional maintenance (e.g. secret rotation).
+
+Happy to provide further context if needed.
+
+Thanks,
+Obinna

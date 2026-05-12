@@ -90,7 +90,7 @@ def is_plausible_rev_value(v: str) -> bool:
     
     # Special characters are NOT plausible - need verification!
     # They might be placeholders (REV: ___) not actual values
-    if s in {"-", "_", ".-", "._"}:
+    if s in {"-", "_", ".-", "._", "__", "---", "___"}:
         return False  # ← FIXED: Need GPT verification
     
     # Single/double letters

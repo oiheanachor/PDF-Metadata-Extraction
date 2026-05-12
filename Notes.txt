@@ -1,3 +1,74 @@
+export AZURE_OPENAI_ENDPOINT="https://<your-resource>.openai.azure.com"
+export AZURE_OPENAI_KEY="<your-key>"
+
+pymupdf: python new_site_rev_extractor.py /path/to/drawings \
+       --mode pymupdf_only \
+       -o results_pymupdf.csv \
+       --max-workers 4 \
+       --trace
+
+
+
+Hybrid: python new_site_rev_extractor.py /path/to/drawings \
+       --mode pymupdf_with_gpt_fallback \
+       --azure-deployment gpt-4.1 \
+       -o results_hybrid.csv \
+       --max-workers 4 \
+       --trace
+
+
+GPT: python new_site_rev_extractor.py /path/to/drawings \
+       --mode gpt_only \
+       --azure-deployment gpt-4.1 \
+       -o results_gpt.csv \
+       --max-workers 4 \
+       --trace
+
+
+
+GPT
+
+Hybrid
+.venv/bin/python Leeds/rev_extractor_updated_v2.py Leeds \
+  --workflow pymupdf-gpt \
+  --deployment-name gpt-4.1 \
+  -o leeds_results_hybrid.csv
+
+
+GPT oNLY
+.venv/bin/python Leeds/rev_extractor_updated_v2.py Leeds \
+  --workflow gpt-only \
+  --deployment-name gpt-4.1 \
+  -o leeds_results_gpt_only.csv
+
+Pymupdf
+.venv/bin/python Leeds/rev_extractor_updated_v2.py Leeds \
+  --workflow pymupdf-only \
+  -o leeds_results_pymupdf_only.csv
+
+
+Hybrid with fewer gpt calls
+.venv/bin/python Leeds/rev_extractor_updated_v2.py Leeds \
+  --workflow pymupdf-gpt \
+  --fallback-below medium \
+  --deployment-name gpt-4.1 \
+  -o leeds_results_hybrid_less_gpt.csv
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 Sample rev numbers
 0-0
 1-0

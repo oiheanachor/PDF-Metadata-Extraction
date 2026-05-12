@@ -29,10 +29,11 @@ GPT: python new_site_rev_extractor.py /path/to/drawings \
 GPT
 
 Hybrid
-.venv/bin/python Leeds/rev_extractor_updated_v2.py Leeds \
+.venv/bin/python Leeds/rev_extractor_leeds_updated.py Leeds \
   --workflow pymupdf-gpt \
   --deployment-name gpt-4.1 \
   -o leeds_results_hybrid.csv
+
 
 
 GPT oNLY

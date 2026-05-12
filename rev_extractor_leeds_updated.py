@@ -125,7 +125,7 @@ def extract_native_pymupdf(pdf_path: Path, enable_ocr: bool = False) -> Optional
             )
         return None
     except Exception as e:
-        LOG.debug(f"Native extraction failed for {pdf_path.name}: {e}")
+        LOG.warning(f"Native extraction failed for {pdf_path.name}: {e}")
         return None
 
 # ---------------------------------------------------------------------
@@ -428,7 +428,10 @@ def run_hybrid_pipeline(
         LOG.warning(f"No PDFs found in {input_folder}")
         return rows
     
+    native_attempted = 0
     native_success = 0
+    native_no_result = 0
+    native_fallback = 0
     gpt_used = 0
     gpt_failed = 0
     
@@ -437,6 +440,7 @@ def run_hybrid_pipeline(
             result = None
 
             if workflow in {"pymupdf-gpt", "pymupdf-only"}:
+                native_attempted += 1
                 result = extract_native_pymupdf(pdf_path, enable_ocr=enable_native_ocr)
 
             if workflow == "pymupdf-only":
@@ -470,12 +474,16 @@ def run_hybrid_pipeline(
                         "confidence": result.confidence,
                         "notes": result.notes[:240],
                     })
-                    LOG.debug(f"✓ Native: {pdf_path.name} → {result.value}")
+                    LOG.info(f"✓ PyMuPDF accepted for {pdf_path.name}: {result.value} ({result.confidence})")
                     continue
+                native_fallback += 1
                 LOG.info(
                     f"Native confidence {result.confidence} for {pdf_path.name}: "
                     f"{result.value or '<blank>'} → Azure GPT fallback"
                 )
+            elif workflow == "pymupdf-gpt":
+                native_no_result += 1
+                LOG.info(f"PyMuPDF found no result for {pdf_path.name} → Azure GPT fallback")
 
             LOG.info(f"→ Using Azure GPT for {pdf_path.name}")
             gpt_used += 1
@@ -511,7 +519,11 @@ def run_hybrid_pipeline(
             writer.writerows(rows)
         
         LOG.info(f"Wrote {output_csv.resolve()} with {len(rows)} rows")
-        LOG.info(f"Stats: Native={native_success}, GPT={gpt_used}, Failed={gpt_failed}")
+        LOG.info(
+            f"Stats: NativeAttempted={native_attempted}, NativeAccepted={native_success}, "
+            f"NativeNoResult={native_no_result}, NativeFallback={native_fallback}, "
+            f"GPT={gpt_used}, Failed={gpt_failed}"
+        )
         if gpt_used > 0:
             LOG.info(f"Cost≈${(gpt_used - gpt_failed) * 0.010:.2f}")
     except Exception as e:

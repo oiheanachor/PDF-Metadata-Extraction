@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 import time
+import inspect
 
 import fitz  # PyMuPDF
 from tqdm import tqdm
@@ -94,19 +95,25 @@ VALID_CONFIDENCE = {"high", "medium", "low", "none", "unknown"}
 # NATIVE EXTRACTION (YOUR EXISTING WORKING CODE)
 # ---------------------------------------------------------------------
 def extract_native_pymupdf(pdf_path: Path, enable_ocr: bool = False) -> Optional[RevResult]:
-    """Try native PyMuPDF extraction using the fixed logic from rev_extractor_fixed."""
+    """Try native PyMuPDF extraction using the Leeds native extractor."""
     try:
-        from rev_extractor_fixed_v2 import (process_pdf_native, _normalize_output_value,
-            DEFAULT_BR_X, DEFAULT_BR_Y, DEFAULT_EDGE_MARGIN, DEFAULT_REV_2L_BLOCKLIST, canonicalize_rev_value, is_plausible_rev_value, is_suspicious_rev_value)
-        
-        best = process_pdf_native(
-            pdf_path,
-            brx=DEFAULT_BR_X,
-            bry=DEFAULT_BR_Y,
-            blocklist=DEFAULT_REV_2L_BLOCKLIST,
-            edge_margin=DEFAULT_EDGE_MARGIN,
-            enable_ocr=enable_ocr,
+        from rev_extractor_leeds_fixed import (
+            process_pdf_native, _normalize_output_value,
+            DEFAULT_BR_X, DEFAULT_BR_Y, DEFAULT_EDGE_MARGIN, DEFAULT_REV_2L_BLOCKLIST,
         )
+        
+        native_kwargs = {
+            "brx": DEFAULT_BR_X,
+            "bry": DEFAULT_BR_Y,
+            "blocklist": DEFAULT_REV_2L_BLOCKLIST,
+            "edge_margin": DEFAULT_EDGE_MARGIN,
+        }
+        if "enable_ocr" in inspect.signature(process_pdf_native).parameters:
+            native_kwargs["enable_ocr"] = enable_ocr
+        elif enable_ocr:
+            LOG.warning("Native OCR requested, but imported native extractor does not support enable_ocr")
+
+        best = process_pdf_native(pdf_path, **native_kwargs)
         
         if best and best.value:
             value = _normalize_output_value(best.value)
@@ -454,6 +461,7 @@ def run_hybrid_pipeline(
                         "notes": result.notes[:240],
                     })
                 else:
+                    native_no_result += 1
                     rows.append({
                         "file": pdf_path.name,
                         "value": "",

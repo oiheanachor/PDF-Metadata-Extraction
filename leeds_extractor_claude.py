@@ -150,16 +150,22 @@ MARKER_RE = re.compile(
 #   X-Y    : 0-0, 1-0, 1-1, 0-3, 2-1, 5-0 etc.
 #   NN     : 0 .. 99 (covers 1, 8, 10, 16 …)
 #   0N     : leading-zero forms 01, 02, … 08
+#   NA     : 1A, 2A, 2B, 2C (digit + letter suffix; seen on some classic
+#            Exeeco drawings — e.g. IR1B13's "2A | CN218 LS 3.3.88" row)
 #   [A-Z]  : single letters
 #
 # We intentionally do NOT accept double letters here — they were a quirk of the
 # previous site and would create grid-letter false positives on this site.
-VALUE_RE = re.compile(r"^(?:\d{1,2}-\d{1,2}|0\d|\d{1,2}|[A-Z])$")
+VALUE_RE = re.compile(r"^(?:\d{1,2}-\d{1,2}|0\d|\d{1,2}[A-Z]|\d{1,2}|[A-Z])$")
 
 # A *narrower* sub-pattern used when we have to choose among many candidates,
 # to score "obvious" values higher than `O` (could be the letter or the Ø symbol).
-HIGH_TRUST_VALUE_RE = re.compile(r"^(?:\d{1,2}-\d{1,2}|0\d|\d{1,2}|[A-DF-Z])$")
-# (Excludes 'E' and 'O' which are common drawing artefacts — Ø, grid 'E' etc.)
+HIGH_TRUST_VALUE_RE = re.compile(
+    r"^(?:\d{1,2}-\d{1,2}|0\d|\d{1,2}[A-DF-Z]|\d{1,2}|[A-DF-Z])$"
+)
+# (Excludes 'E' and 'O' which are common drawing artefacts — Ø, grid 'E' etc.
+# Includes NA forms 1A, 2A, 2B, 2C... — same letter set as the single-letter
+# alternative, so the high-trust suffix is A, B, C, D, F-Z.)
 
 # Title-block anchor words help confirm we're in the right region.
 TITLE_BLOCK_ANCHORS = {
@@ -180,14 +186,11 @@ REV_TABLE_HEADERS = {
 }
 
 # Words/values that should never be returned as the answer — common false friends.
+# These all match VALUE_RE in shape but are overwhelmingly non-revision tokens
+# on this site. Note: two-letter words (NO, OF, BS, CT, …) are NOT in this set
+# because VALUE_RE doesn't accept them in the first place; we only need to
+# blocklist single-character values that VALUE_RE WOULD otherwise accept.
 BLOCKLIST_VALUES = {
-    "NO",          # column header "No"
-    "OF",          # "Sheet 1 OF 1"
-    "AT", "BY", "IN", "ON", "TO", "OR",
-    "DO", "EC", "CN",
-    "BS",          # "BS970", "BS EN" etc.
-    "PA",
-    "CT",          # CT5, CT9 grade letters next to a digit
     # Diameter symbol Ø is frequently exported as the bare letter "O" by PDF
     # tools. On engineering drawings the standalone letter O is overwhelmingly
     # this symbol, not a real revision value. The value set for this site
@@ -295,22 +298,71 @@ def _norm_text(t: str) -> str:
     return re.sub(r"\s+", " ", t.replace("\u00A0", " ")).strip()
 
 
-def _looks_like_grid_letter(t: Token, page_w: float, page_h: float) -> bool:
+def _looks_like_grid_letter(
+    t: Token,
+    page_w: float,
+    page_h: float,
+    tokens: Optional[Sequence[Token]] = None,
+) -> bool:
     """Heuristic: is this token the drawing-grid label, not a real value?
 
     Grid labels in this site sit in a column at the absolute left/right edge
     (commonly `A B C D E F` repeated vertically) or a row at the absolute
-    top/bottom (`1 2 3 4 5 6 7 8`). The single-letter check uses an *absolute*
-    margin in points rather than a fraction of the page, because the title
-    block's first data column often sits just 40-50 px from the page edge —
-    well inside any percentage-based margin we'd otherwise pick.
+    top/bottom (`1 2 3 4 5 6 7 8`). The fallback uses an *absolute* margin in
+    points (rather than a fraction of the page) because title-block cells are
+    often only ~40 px from the page edge.
+
+    BUT — and this is critical — the absolute-margin rule must only fire when
+    there's positive evidence of an actual grid: at least 2 other single-letter
+    or single-digit tokens clustered at the same edge. Otherwise a genuine
+    ISSUE-column value (e.g. an `A` at x=16 in a left-aligned classic-Exeeco
+    table) gets falsely flagged. When ``tokens`` is None we fall back to the
+    plain absolute rule for backwards compatibility, but the value-candidate
+    path always passes ``tokens`` to enable the context check.
     """
-    if GRID_LETTER_PATTERN.fullmatch(t.text):
-        if t.x < 38.0 or t.x > page_w - 38.0:
-            return True
-    if GRID_NUMBER_PATTERN.fullmatch(t.text):
-        if t.y < 32.0 or t.y > page_h - 32.0:
-            return True
+    is_letter = bool(GRID_LETTER_PATTERN.fullmatch(t.text))
+    is_number = bool(GRID_NUMBER_PATTERN.fullmatch(t.text))
+    if not (is_letter or is_number):
+        return False
+
+    if is_letter:
+        at_left = t.x < 38.0
+        at_right = t.x > page_w - 38.0
+        if not (at_left or at_right):
+            return False
+        # Context check: do other grid-letter siblings exist at the same x?
+        if tokens is not None:
+            siblings = 0
+            for s in tokens:
+                if s is t:
+                    continue
+                if not GRID_LETTER_PATTERN.fullmatch(s.text):
+                    continue
+                if abs(s.x - t.x) <= 6.0 and abs(s.y - t.y) > max(t.h, 5.0) * 1.5:
+                    siblings += 1
+                    if siblings >= 2:
+                        return True
+            return False  # alone at the edge → not a grid label
+        return True  # no context — preserve old behaviour
+
+    if is_number:
+        at_top = t.y < 32.0
+        at_bottom = t.y > page_h - 32.0
+        if not (at_top or at_bottom):
+            return False
+        if tokens is not None:
+            siblings = 0
+            for s in tokens:
+                if s is t:
+                    continue
+                if not GRID_NUMBER_PATTERN.fullmatch(s.text):
+                    continue
+                if abs(s.y - t.y) <= 6.0 and abs(s.x - t.x) > max(t.w, 5.0) * 1.5:
+                    siblings += 1
+                    if siblings >= 2:
+                        return True
+            return False
+        return True
     return False
 
 
@@ -416,7 +468,19 @@ def _is_grid_label(
 # ===========================================================================
 
 def _extract_tokens(page: fitz.Page) -> Tuple[List[Token], PageGeometry]:
-    """Pull native tokens from a page, converting to visual coordinates."""
+    """Pull native tokens from a page, converting to visual coordinates.
+
+    PyMuPDF's ``page.get_text("words")`` returns word bounding boxes in the
+    page's MEDIABOX coordinate system, not its visual coordinate system. For
+    pages with a non-zero ``page.rotation`` the visual page is rotated
+    relative to the mediabox, so:
+
+      * (cx, cy) needs to be transformed via ``_rotate_point``.
+      * (w, h) are mediabox-orientation dimensions; on pages rotated by 90°
+        or 270° these are swapped relative to the visual orientation. We
+        swap them here so downstream code can treat ``marker.w`` as the
+        visual word width and ``marker.h`` as the visual word height.
+    """
     mb = page.mediabox
     mb_w, mb_h = mb.width, mb.height
     rotation = page.rotation or 0
@@ -424,16 +488,23 @@ def _extract_tokens(page: fitz.Page) -> Tuple[List[Token], PageGeometry]:
     tokens: List[Token] = []
     page_w_v = mb_w
     page_h_v = mb_h
+    swap_wh = rotation in (90, 270)
     for x0, y0, x1, y1, txt, *_ in raw:
         s = _norm_text(txt)
         if not s:
             continue
         cx = (x0 + x1) / 2.0
         cy = (y0 + y1) / 2.0
-        w = x1 - x0
-        h = y1 - y0
+        mb_word_w = x1 - x0
+        mb_word_h = y1 - y0
         vx, vy, page_w_v, page_h_v = _rotate_point(cx, cy, rotation, mb_w, mb_h)
-        tokens.append(Token(text=s, x=vx, y=vy, w=w, h=h, mx=cx, my=cy))
+        if swap_wh:
+            visual_w, visual_h = mb_word_h, mb_word_w
+        else:
+            visual_w, visual_h = mb_word_w, mb_word_h
+        tokens.append(Token(text=s, x=vx, y=vy,
+                            w=visual_w, h=visual_h,
+                            mx=cx, my=cy))
     geom = PageGeometry(
         width=page_w_v,
         height=page_h_v,
@@ -507,18 +578,26 @@ def _is_template_stamp(
     templates place in an absolute page corner (typically bottom-left).
 
     Such stamps are noise — they describe the *template* version, not the
-    drawing's revision. The give-aways are:
+    drawing's revision. They sit very near a page corner (often rendered
+    vertically along the page edge, like ``Rev 1`` written sideways at the
+    bottom-left). The give-aways are:
 
-      * the marker sits inside the absolute corner of the page (<= 30 px from
-        both adjacent edges), AND
-      * there is another marker of an equivalent type within ~50 px (the
-        genuine title-block or table-header marker).
-
-    The genuine title-block / table-header marker is always slightly inset
-    from the page edge to leave room for the box border, so the corner-pinned
-    one is the stamp.
+      * the marker's centre sits within ~45 px of two adjacent page edges
+        (we allow this wide a margin because vertically-rendered stamps
+        report ``w``/``h`` from their original drawing orientation, so the
+        physical bbox may not hug the page edge), AND
+      * there is another marker of an equivalent type within ~100 px whose
+        position is substantially more inset from those same edges (the
+        genuine column header / title-block marker is always at least one
+        cell-width inside the table border), AND
+      * that sibling marker is on a DIFFERENT row from this one (different
+        y by more than one row-height). This last check prevents same-row
+        marker pairs — like the ``ISSUE | ALTERATIONS`` classic-Exeeco
+        column headers — from being mistaken for a stamp + genuine pair.
+        A real template stamp is in a different cell from its sibling, not
+        side-by-side on the same row.
     """
-    corner_margin = 30.0
+    corner_margin = 45.0
     near_left = marker.x <= corner_margin
     near_right = marker.x >= page_w - corner_margin
     near_top = marker.y <= corner_margin
@@ -527,18 +606,29 @@ def _is_template_stamp(
                 or (near_top and near_left) or (near_top and near_right)
     if not in_corner:
         return False
-    # Look for another non-corner marker within ~100 px (i.e. the real one).
-    # Wider than strictly needed for the observed cases (which had the genuine
-    # marker within ~25 px) but generous enough to catch template variations
-    # we haven't seen yet.
+    # Distance to the *nearest* page edge — small for corner-pinned stamps.
+    own_inset = min(marker.x, page_w - marker.x, marker.y, page_h - marker.y)
+    # "Different row" threshold: a marker pair sitting on the same row of a
+    # column-header table (like classic-Exeeco "ISSUE | ALTERATIONS") will
+    # have y-diff under a few pixels (just baseline jitter). A genuine
+    # template stamp sits in a different cell from its sibling — at least
+    # ~10 px away in y. We use a fixed 10 px threshold rather than a
+    # marker.h multiple because the stamp marker's visual height can be
+    # ~12 px (when rendered vertically) and the genuine sibling's height
+    # can be similar; a multiple of either makes the check too generous.
+    same_row_threshold = 10.0
+    # Look for another non-corner marker within ~100 px whose own minimum
+    # inset is substantially greater (at least 10 px more inset) AND which
+    # is on a different row.
     for other in other_markers:
         if other is marker:
             continue
         if _distance((other.x, other.y), (marker.x, marker.y)) > 100.0:
             continue
-        # The "real" marker is the one further from each relevant edge.
-        if min(other.x, page_w - other.x, other.y, page_h - other.y) > \
-           min(marker.x, page_w - marker.x, marker.y, page_h - marker.y) + 5.0:
+        if abs(other.y - marker.y) < same_row_threshold:
+            continue  # same-row sibling — likely a paired column header
+        other_inset = min(other.x, page_w - other.x, other.y, page_h - other.y)
+        if other_inset > own_inset + 10.0:
             return True
     return False
 
@@ -556,16 +646,20 @@ def _is_inline_rev_reference(marker: Token, tokens: Sequence[Token]) -> bool:
     "REV" tokens are flanked by other words.
     """
     same_line = max(marker.h, 6.0) * 1.2
+    # Actual edge-to-edge distance from the right edge of a candidate left
+    # neighbor to the left edge of the marker. Word ending within ~12 px of
+    # the marker's left edge AND containing alphabetic text suggests the
+    # marker is embedded in running text (CONTRACT G/T12345 REV 8) rather
+    # than serving as an isolated label in its own cell.
+    marker_left = marker.x - marker.w / 2.0
     for t in tokens:
         if t is marker:
             continue
         if abs(t.y - marker.y) > same_line:
             continue
-        gap = marker.x - (t.x + t.w / 2.0)
-        # Word ending within ~20 px to the left of the marker AND that word
-        # is itself a "real" text word (length >= 3, alphabetic) suggests
-        # the marker is inline.
-        if 0 < gap <= 25.0 and len(t.text) >= 3:
+        t_right = t.x + t.w / 2.0
+        gap = marker_left - t_right
+        if 0 < gap <= 12.0 and len(t.text) >= 3:
             upper = t.text.upper()
             # Skip if the left-neighbour is itself a known label/anchor.
             if upper in TITLE_BLOCK_ANCHORS:
@@ -670,7 +764,11 @@ def _value_candidates_near_marker(
                               grid_ys or (-1.0, -1.0)):
                 continue
         else:
-            if _looks_like_grid_letter(t, page_w, page_h):
+            # Pass the full token list so the fallback can verify whether a
+            # plausible grid actually exists. This prevents a genuine ISSUE
+            # value at x<38 from being misclassified as a grid letter on
+            # templates that have no drawing grid.
+            if _looks_like_grid_letter(t, page_w, page_h, tokens=tokens):
                 continue
         if _distance((t.x, t.y), (marker.x, marker.y)) <= radius:
             out.append(t)
@@ -731,34 +829,51 @@ def _pick_latest_in_title_block(
     """Pick the latest revision value in a *title-block* layout.
 
     Rule established for this site:
-      - Marker label sits at the top of the column.
+      - Marker label sits at the top of a small cell.
       - The current value sits directly *below* the marker (larger ``y``).
-      - When multiple values are stacked, the **bottom-most** (largest ``y``)
-        is the latest.
+      - If multiple values are stacked inside the SAME cell (e.g. ``A`` then a
+        newer ``1`` below it), the bottom-most of that stack is the latest.
+      - Values further down (e.g. "Sheet 1 of N" or the page footer) are
+        almost always different cells and must NOT be picked.
 
-    We require the candidate to sit *inside* the marker's column (small
-    ``|Δx|``) and *below* the marker (``y > marker.y``). The column tolerance
-    is deliberately tight: title-block cells in this site are 20-40 px wide.
+    Algorithm: cluster candidates by row (within ~one row height) below the
+    marker. Pick the TOP-most cluster (the cell directly under the marker).
+    Within that cluster, take the bottom-most value. This handles both the
+    common single-value case and the rare in-cell stacking case correctly,
+    while ignoring "Sheet 1 of 2" which sits in a separate cell further down.
     """
     if not candidates:
         return None
-    # Title-block column width tolerance. Marker height is a good proxy for
-    # cell line height; multiply by 3 to allow modest horizontal drift.
+    # Title-block column width tolerance.
     col_tol = max(marker.w * 1.2, marker.h * 3.0, 18.0)
     in_column: List[Token] = []
     for c in candidates:
         if c.y <= marker.y + max(c.h, marker.h) * 0.3:
-            continue  # at or above the marker — not the "value below" cell
+            continue  # at or above the marker
         if abs(c.x - marker.x) > col_tol:
             continue  # outside the marker's column
-        # The value should also be reasonably close vertically (within a few
-        # rows). Title-block cells are rarely taller than ~60 px.
         if c.y - marker.y > max(marker.h, c.h) * 8.0:
-            continue
+            continue  # way too far down — different cell
         in_column.append(c)
     if in_column:
-        # Latest = bottom-most (largest y), then closest to marker x.
-        best = max(in_column, key=lambda t: (t.y, -abs(t.x - marker.x)))
+        # Sort by y ascending (top to bottom).
+        in_column.sort(key=lambda t: t.y)
+        # The primary value sits closest below the marker.
+        primary = in_column[0]
+        # Check for in-cell stacking: a second value within ~12 px of the
+        # primary. This handles "A then 1" inside the same revision cell.
+        # Why 12 px specifically:
+        #   - Typical cell-to-cell spacing on this site is ~16 px (one row).
+        #     A "Sheet 1 of 2" row sitting one cell below "Rev 1-0" is ~16 px
+        #     down — outside the 12 px window, so it won't be wrongly bundled.
+        #   - In-cell stacking ("A" with "1" written underneath) is typically
+        #     ~8-10 px because the two values share one cell's vertical space.
+        # The constant 12.0 is independent of marker.h because cell heights
+        # are template-driven and largely uniform on this site.
+        stack_threshold = 12.0
+        stacked = [c for c in in_column if c.y - primary.y <= stack_threshold]
+        # Take the bottom-most of the stack.
+        best = max(stacked, key=lambda t: (t.y, -abs(t.x - marker.x)))
         return best, "below-marker"
     # Fallback: candidate sitting on the same line, immediately to the right.
     same_line = [
@@ -783,22 +898,43 @@ def _pick_latest_in_revision_table(
     Rule established for this site:
       - Newer revisions are stacked **above** older ones (smaller ``y``).
       - The header (``Iss. | EC | Revised | …``) sits *below* the data rows.
-      - The marker tends to be the header itself.
+      - The marker is the column header itself.
 
     So we want the candidate with the **smallest** ``y`` (top-most) that is
-    *above* the marker header.
+    *above* the marker header AND inside the first column.
+
+    Both bounds are deliberately tight: the BL revision-history table on this
+    site has narrow columns (~20-30 px wide) and the data rows above the
+    header are typically only 2-6 rows tall (cap ~6× row height). The
+    previous looser bounds were grabbing stray letters/digits from the
+    drawing's notes/title-block area sitting above the table.
     """
     above_header: List[Token] = []
+    # Tight column tolerance: the value sits in the same narrow column as the
+    # header. Allow ~1.5× the marker width plus a small constant for OCR drift.
+    col_tol = max(marker.w * 1.5, marker.h * 3.0, 18.0)
+    # Row height proxy: header text height × ~2 gives one data-row height.
+    row_h = max(marker.h, 6.0) * 2.2
+    # Cap how far ABOVE the header we look. Most revision tables on this site
+    # have 1-3 data rows but long-lived drawings can accumulate 8+. We cap at
+    # ~8 row heights — comfortably above the typical case while staying clear
+    # of the gap that separates the table from the notes/title-block content
+    # sitting above it on this site's templates.
+    max_above = row_h * 8.0
     for c in candidates:
-        # Must be at least one row above the marker (account for row height).
+        # Must be at least one row above the marker.
         if c.y >= marker.y - max(c.h, marker.h) * 0.4:
             continue
-        # Must be in the first column (roughly aligned with the marker x).
-        if abs(c.x - marker.x) > max(c.w, marker.w) * 6.0 + 30.0:
+        # Cap how far above we search.
+        if marker.y - c.y > max_above:
+            continue
+        # Must be in the first column.
+        if abs(c.x - marker.x) > col_tol:
             continue
         above_header.append(c)
     if not above_header:
         return None
+    # Latest = top-most. Tie-break by column closeness.
     best = min(above_header, key=lambda t: (t.y, abs(t.x - marker.x)))
     return best, "above-header"
 
@@ -826,29 +962,62 @@ def _pick_latest_in_classic_issue_table(
     Latest issue = the **bottom-most** value in the column directly below the
     `ISSUE` header.
 
-    Column-alignment tolerance is deliberately tight: the ISSUE column is
-    typically only 30-50 px wide and the value sits centred in it. We reject
-    candidates more than ~22 px off the header x.
+    Two safeguards against stray-token contamination:
+      1. **Tight column tolerance.** The ISSUE column is narrow (~30-50 px);
+         we reject candidates more than ~22 px off the header x. This stops
+         dimension annotations like ``25`` or ``8`` (which sit in the drawing
+         body) from leaking in.
+      2. **Row cadence.** The real table has consistent inter-row spacing.
+         After collecting in-column candidates, we walk them top-to-bottom and
+         keep only those whose y-gap to the previous accepted row is within
+         a row-height window. A stray value far below the last real row
+         (e.g. the ``25`` dimension in 8C528r4 sitting 200+ px below row ``4``)
+         is rejected by the cadence break.
     """
     if not candidates:
         return None
-    col_tol = max(marker.w * 1.4, marker.h * 2.4, 18.0)
+    # Tighter column tolerance than before. The ISSUE header is itself only
+    # ~25 px wide; the value cells are ~the same. Keep tolerance scaled to
+    # marker geometry with a floor.
+    col_tol = max(marker.w * 1.2, marker.h * 3.0, 18.0)
     in_column: List[Token] = []
     for c in candidates:
         if c.y <= marker.y + max(marker.h, c.h) * 0.2:
             continue  # at or above marker = not a data row
         if abs(c.x - marker.x) > col_tol:
-            continue  # outside the ISSUE column
-        # Reject rows much further down than the issue table actually extends.
-        # An issue table rarely runs more than 10-12 rows tall; values further
-        # away than ~20× marker height are almost certainly something else.
-        if c.y - marker.y > max(marker.h, c.h) * 20.0:
+            continue
+        # Hard upper bound: an issue table is at most ~14 rows on this site.
+        if c.y - marker.y > max(marker.h, c.h) * 28.0:
             continue
         in_column.append(c)
     if not in_column:
         return None
-    # Latest = bottom-most.
-    best = max(in_column, key=lambda t: (t.y, -abs(t.x - marker.x)))
+    # Walk top-to-bottom, enforcing row-cadence continuity.
+    in_column.sort(key=lambda t: t.y)
+    # Compute the typical row spacing from the actual in-column gaps (the
+    # marker height is a poor proxy because the header text and data text
+    # are often different sizes — the header may be larger). Median of the
+    # first few gaps gives a robust estimate.
+    if len(in_column) >= 3:
+        gaps = sorted(in_column[i+1].y - in_column[i].y for i in range(min(4, len(in_column)-1)))
+        typical_row = gaps[len(gaps)//2]
+    else:
+        typical_row = max(marker.h, 6.0) * 1.0
+    # Allow up to ~2.0× the typical row spacing before declaring a cadence
+    # break. This handles double-height "wrapped notes" rows where the
+    # alteration description spans two text lines (common pattern: "REDRAWN
+    # ON AUTOCAD" then "CN955 DH 24.11.97" wrapped onto two lines, doubling
+    # the row's vertical extent) while still rejecting truly disconnected
+    # values like a "25" dimension 6+ rows below the last real row.
+    max_gap = max(typical_row * 2.0, 14.0)
+    accepted = [in_column[0]]
+    for c in in_column[1:]:
+        prev_y = accepted[-1].y
+        if c.y - prev_y > max_gap:
+            break  # cadence broken — anything beyond is outside the table
+        accepted.append(c)
+    # Latest = bottom-most among accepted.
+    best = max(accepted, key=lambda t: (t.y, -abs(t.x - marker.x)))
     return best, "below-marker"
 
 
@@ -924,15 +1093,21 @@ def _extract_from_marker(
     )
     is_table_marker = _is_revision_table_marker(marker, tokens)
 
-    # Collect raw candidates first within a generous radius.
+    # Collect raw candidates within a generous radius. The previous 120 px
+    # cut off the 7th row of long classic-Exeeco issue tables (e.g.
+    # IR1B12r07.pdf where row "7" is ~134 px below the ISSUE header). The
+    # per-region pickers below apply tight column/row filters, so widening
+    # the gather radius doesn't increase false positives — it just lets the
+    # later, smarter filters see the right rows.
+    GATHER_RADIUS = 220.0
     raw = _value_candidates_near_marker(
-        marker, tokens, page_w, page_h, radius=120.0,
+        marker, tokens, page_w, page_h, radius=GATHER_RADIUS,
         grid_xs=grid_xs, grid_ys=grid_ys,
     )
 
     # Also include any stitched hyphenated values we synthesised from this neighbourhood.
     synth = _expand_hyphenated_values(
-        [t for t in tokens if _distance((t.x, t.y), (marker.x, marker.y)) <= 120.0]
+        [t for t in tokens if _distance((t.x, t.y), (marker.x, marker.y)) <= GATHER_RADIUS]
     )
     raw = raw + synth
 
@@ -1071,17 +1246,22 @@ def _is_strictly_newer(a: str, b: str) -> bool:
 
     def _key(v: str) -> Tuple[int, Tuple[int, ...]]:
         v = v.strip().upper()
-        # Hyphenated → (2, (major, minor))
+        # Hyphenated → (2, (major, minor, 0))
         m = re.fullmatch(r"(\d{1,2})-(\d{1,2})", v)
         if m:
-            return (2, (int(m.group(1)), int(m.group(2))))
-        # Pure number → (1, (n,))
+            return (2, (int(m.group(1)), int(m.group(2)), 0))
+        # Number + letter suffix (e.g. 2A, 2B): slot between 2 and 3.
+        # Encode as (1, (n, suffix_ord+1, 0)) so "2A" > "2" and "2A" < "3".
+        m = re.fullmatch(r"(\d{1,2})([A-Z])", v)
+        if m:
+            return (1, (int(m.group(1)), ord(m.group(2)) - ord("A") + 1, 0))
+        # Pure number → (1, (n, 0, 0))
         if re.fullmatch(r"\d{1,2}", v) or re.fullmatch(r"0\d", v):
-            return (1, (int(v),))
-        # Single letter → (0, (ord,))
+            return (1, (int(v), 0, 0))
+        # Single letter → (0, (ord, 0, 0))
         if re.fullmatch(r"[A-Z]", v):
-            return (0, (ord(v) - ord("A"),))
-        return (-1, (0,))
+            return (0, (ord(v) - ord("A"), 0, 0))
+        return (-1, (0, 0, 0))
 
     return _key(a) > _key(b)
 
@@ -1465,6 +1645,7 @@ A returned `rev_value` must match exactly one of these forms:
 - Leading-zero single number: 00, 01, 02, 03, 04, 05, 06, 07, 08, 09
 - Plain integer: 0, 1, 2, 3, ... up to 99
 - Single letter: A, B, C, D (and any other A-Z if you see it clearly — but NEVER `O` or `I` — see false friends)
+- **Alphanumeric (digit + letter suffix): 1A, 2A, 2B, 2C, 10A, etc.** Some classic-Exeeco drawings have rows like `2A | CN218 LS 3.3.88` where a minor in-place edit was made to revision `2`. Treat these as valid revision values. Same letter restriction applies — never `O` or `I` as the suffix.
 - Blank (the title block field is empty AND no revision table value can be read): return `rev_value = ""` with `region = "blank"`.
 
 Reject anything else. If the only candidate you can see is something like `O` (diameter symbol), `I`, `E` (grid letter), a year (`2014`, `19`), a sheet number (`Sheet 1 of 1`), or a contract reference (`CONTRACT G/T12345 REV 8`), return `rev_value = ""` with low confidence.
@@ -1481,15 +1662,15 @@ There are three regions to consider, in priority order:
 
 # Chronology rule per region
 
-- **Title block (bottom-right):** if multiple values are stacked in the cell (e.g. an `A` on one line and a `1` below it), the **bottom-most** is the current value. The label is on top, the value is directly below.
-- **Bottom-left revision history table:** the header sits at the bottom; data grows upward; the **top-most** data row (visually highest above the header) is the current value.
-- **Top-left ISSUE/ALTERATIONS table:** the header sits at the top; data grows downward; the **bottom-most** value in the ISSUE column is the current value.
+- **Title block (bottom-right):** the value sits inside the SAME small cell as the `Rev` / `Iss.` label, **directly below** the label. Pick the value-shaped token *immediately* under the label (typically 5–15 px below). Do NOT pick a token sitting two rows or more below — that token is in a different cell (most commonly the `Sheet 1 of 2` row, where the trailing `2` is the sheet count, NOT the revision). If multiple values are visibly stacked inside the same cell (e.g. an `A` on one line with a `1` right under it within the cell border), the **bottom-most** of that stack is the latest.
+- **Bottom-left revision history table:** the header sits at the bottom of the table; data grows upward; the **top-most** data row (visually highest above the header) is the current value. Only consider tokens that are clearly inside the leftmost column of the table — do NOT pull letters from material specs, notes, or title-block text that happen to sit above the table.
+- **Top-left ISSUE/ALTERATIONS table:** the header sits at the top; data grows downward; the **bottom-most** value in the ISSUE column is the current value. The table has a clear border or visible row separators; do NOT include values from outside the table (e.g. dimension annotations, hole counts, or part-reference table rows that happen to share a similar column position).
 
 # Conflict resolution (very important)
 
 The revision history table can carry a NEWER value than the title-block field. When both regions show a value:
 
-- If the bottom-left revision history table contains a value that is *strictly newer* than the title-block field, use the **table** value. Chronology: letters < numbers (A < B < ... < Z, then 1 > Z; once a number appears the letters are obsolete); within numbers, larger is newer; within hyphenated forms, compare lexicographically on each side (`1-0 < 1-1 < 2-0`).
+- If the bottom-left revision history table contains a value that is *strictly newer* than the title-block field, use the **table** value. Chronology: letters < numbers (A < B < ... < Z, then 1 > Z; once a number appears the letters are obsolete); within numbers, larger is newer; alphanumeric `NA` forms slot between consecutive numbers (`2 < 2A < 2B < 2C < 3`); within hyphenated forms, compare lexicographically on each side (`1-0 < 1-1 < 2-0`).
 - If the title-block field is blank but the table has values, use the table.
 - Otherwise prefer the title-block field.
 
@@ -1505,9 +1686,19 @@ Do **not** return any of these even if they look like values:
 - Single 1-8 digits in a horizontal row at the absolute top or bottom edge of the page — drawing-grid labels.
 - `Sheet 1 of 1` style annotations — the `1` here is the sheet number.
 - `Rev 01` printed near a page corner with no other revision-table context — a template-version stamp; ignore.
-- `CONTRACT G/T... REV 8` and similar — body-text contract references; ignore the `8`.
+- **CONTRACT REFERENCES** — text such as `CONTRACT G/T12345 REV 8`, `CONTRACT G/UG122001 REV 22`, `CONTRACT G/C0606402 REV 3`, or any other `CONTRACT ... REV N` phrasing IS NOT the drawing's revision. It is a reference to a contract document and must be ignored entirely. The `REV N` inside a contract reference is part of the contract identifier, not this drawing's revision. **If the only `REV N` you can see appears inside or next to the word `CONTRACT`, return `rev_value = ""` rather than that number.**
 - Years rendered next to `Rev`/`Iss.` cells (e.g. `2014`, `19`) — also ignore.
 - The letter inside `REF 'A'` boxes in the parts list of an Exeeco drawing — that's a part reference, not a revision.
+- **PARTS / DIMENSION REFERENCE TABLES** — many drawings include a `REF | PART No | DIMENSIONS` or similar reference table whose first column lists `1, 2, 3, ...`. The `REF` header is NOT a revision label, and the numbers in that column are part numbers. The genuine ISSUE table is always labelled `ISSUE` (not `REF`) and lives in the top-left or bottom-left of the drawing layout.
+- **Dimension annotations** (e.g. a standalone `25` or `8` in the drawing body labelling a length) — these are not revision values.
+
+# Rotated content (very important)
+
+Some scanned or auto-CAD-exported drawings are rendered with the page rectangle in portrait orientation BUT the drawing content drawn rotated 90 degrees (so the title block, ISSUE table and notes all read sideways relative to the page). When you see this, do NOT rotate your reading frame to follow the page outline — read the drawing in its natural orientation as if the rotated content were upright. The ISSUE table is still labelled `ISSUE` and is still adjacent to a column of revision letters/numbers; the title block still has a `Rev` or `Iss.` cell with a value below the label. The ROTATION is a rendering artefact, not a structural change.
+
+# Single-row classic-Exeeco issue tables
+
+A very common pattern on this site: the classic-Exeeco TL issue table has only ONE data row — `A | ORIGINAL ISSUE`. In that case the answer is `A`, full stop. Do not look elsewhere for a "newer" value. Specifically, do not return a number you see in the drawing body (contract refs, part numbers, dimensions) just because no other ISSUE row exists; the single `A` row IS the answer.
 
 # Output
 
@@ -1546,6 +1737,24 @@ Example B — modern Rotork drawing with simple title block:
 Example C — classic Exeeco drawing with multi-row ISSUE table:
   - Top-left table: header `ISSUE | ALTERATIONS`; rows `A`, `1`, `2`, `3`, `4`, `5` reading top-to-bottom
   - Correct answer: rev_value=5, region=tl_issue (bottom-most in ISSUE column)
+
+Example D — classic Exeeco drawing with single-row ISSUE table and a contract-ref distractor:
+  - Top-left table: header `ISSUE | ALTERATIONS`; one row: `A | ORIGINAL ISSUE`
+  - Body of drawing contains: `CONTRACT G/C0606402 REV 3` and `8 HOLES TAP 1-8 UNC` and dimensions like `25`, `8`, `4`
+  - Correct answer: rev_value=A, region=tl_issue. The `REV 3` is a CONTRACT reference (ignore). The `8` is a hole-count (ignore). The single `A` row is the answer.
+
+Example E — content drawn rotated 90 degrees on the page:
+  - Page rectangle is portrait, but the drawing content (including ISSUE table and title block) is drawn sideways
+  - Read the drawing in its NATURAL orientation. The ISSUE table is still labelled `ISSUE` even if rotated. Apply the same rules — bottom-most value in the ISSUE column.
+
+Example F — classic Exeeco ISSUE table with alphanumeric in-place revisions:
+  - Top-left table: rows `A`, `1`, `2`, `2A`, `2B`, `2C`, `3`, `4`, `5`, `6` reading top-to-bottom
+  - Correct answer: rev_value=6, region=tl_issue (bottom-most in ISSUE column). The `2A`/`2B`/`2C` rows are valid revision values too; they sit between `2` and `3` in the chronology. If the bottom-most were `2C`, the answer would be `2C`.
+
+Example G — Sheet-N false-friend in title block:
+  - Bottom-right title block cell: `Rev` label with `1-0` directly below it (a few pixels under the label)
+  - One cell-row further down: `Sheet 1 of 2` (so a stray `1` and `2` appear below the revision cell)
+  - Correct answer: rev_value=1-0, region=br_title. The `2` further down is the sheet count, NOT a revision. The value must come from the cell DIRECTLY below the `Rev` label, not the row below that.
 """
 
 
@@ -1636,10 +1845,81 @@ class AzureVisionExtractor:
 
     # ---- rendering helpers ------------------------------------------------
 
-    def _render_page_b64(self, page: fitz.Page, dpi: int) -> str:
+    def _render_page_b64(self, page: fitz.Page, dpi: int,
+                        extra_rotation: int = 0) -> str:
+        """Render page to a base64 PNG. ``extra_rotation`` is applied on top of
+        the page's native rotation (use 90/180/270 for content-rotated scans
+        where the page rectangle is portrait but the drawing was drawn
+        sideways)."""
         import base64
-        pix = page.get_pixmap(dpi=dpi)
+        if extra_rotation:
+            # Apply rotation via the transformation matrix.
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom).prerotate(extra_rotation)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+        else:
+            pix = page.get_pixmap(dpi=dpi)
         return base64.b64encode(pix.tobytes("png")).decode("ascii")
+
+    @staticmethod
+    def _detect_content_rotation(page: fitz.Page) -> int:
+        """Best-effort detection of content rotation for drawings whose page
+        rectangle is upright (rotation=0) but whose content was drawn rotated
+        90, 180, or 270 degrees.
+
+        Returns the rotation in degrees that should be applied on top of the
+        page's native rotation to bring the drawing upright. Returns 0 when
+        no extra rotation is needed or we cannot tell.
+
+        IMPORTANT: this detector only applies when ``page.rotation == 0``.
+        When the PDF has a declared rotation, PyMuPDF already accounts for
+        it (page.rect, get_pixmap, etc. all return visually-correct output),
+        so adding additional rotation would un-correct the page. The case
+        we DO want to catch is when page.rotation is 0 but the drawing
+        author placed the content sideways inside the upright page — a
+        pathology common in scanned drawings and some auto-CAD exports.
+
+        Strategy: look at the dominant text direction. For pages where
+        most text reads upright (dir≈(1,0)), no rotation is needed.
+        Otherwise, return the inverse rotation needed to make the dominant
+        text direction become upright.
+
+        For pure scans (no native text at all) this returns 0 — callers
+        should probe multiple rotations via GPT confidence.
+        """
+        # Skip detection on pages with a declared rotation — PyMuPDF
+        # already handles those.
+        if (page.rotation or 0) != 0:
+            return 0
+        try:
+            txt = page.get_text("dict")
+        except Exception:  # noqa: BLE001
+            return 0
+        # Count blocks by their text direction. `dir` is a (dx, dy) unit
+        # vector along the writing direction.
+        rot_counts = {0: 0, 90: 0, 180: 0, 270: 0}
+        for block in txt.get("blocks", []):
+            for line in block.get("lines", []):
+                d = line.get("dir", (1.0, 0.0))
+                dx, dy = d
+                # Map (dx,dy) → nearest cardinal direction → rotation degrees
+                # of the text relative to upright.
+                if abs(dx) > abs(dy):
+                    rot = 0 if dx > 0 else 180
+                else:
+                    rot = 270 if dy > 0 else 90
+                rot_counts[rot] = rot_counts.get(rot, 0) + 1
+        if not any(rot_counts.values()):
+            return 0
+        dominant = max(rot_counts, key=lambda k: rot_counts[k])
+        total = sum(rot_counts.values())
+        # Require the dominant direction to be a clear majority (>60%) AND
+        # non-zero before declaring content rotation. Otherwise the page is
+        # probably already upright.
+        if dominant == 0 or rot_counts[dominant] / total < 0.6:
+            return 0
+        # Apply the INVERSE rotation to bring the content upright.
+        return (360 - dominant) % 360
 
     def _render_region_b64(
         self,
@@ -1729,17 +2009,27 @@ class AzureVisionExtractor:
         """Extract from a single PDF page using the GPT pipeline.
 
         Order of operations:
-          1. Primary pass: full page at ``self.primary_dpi``.
-          2. If primary returns ``confidence != high`` or invalid JSON, retry
+          1. Detect content rotation (native-text orientation analysis).
+          2. Primary pass: full page at ``self.primary_dpi`` with the detected
+             rotation applied.
+          3. If primary returns ``confidence != high`` or invalid JSON, retry
              primary once with a stricter user nudge.
-          3. If still not ``high`` and ``enable_region_zoom`` is set, render
+          4. If still not ``high`` and the page is a pure scan (so rotation
+             couldn't be detected), try the three other rotations and pick
+             the highest-confidence valid response.
+          5. If still not ``high`` and ``enable_region_zoom`` is set, render
              the most-likely region (per primary's `region` hint, or BR by
              default) at higher DPI and re-ask.
-          4. Reconcile, return the highest-confidence valid result.
+          6. Reconcile, return the highest-confidence valid result.
         """
         trace: List[str] = []
+        # Detect content rotation.
+        content_rot = self._detect_content_rotation(page)
+        if content_rot:
+            trace.append(f"detected content rotation: {content_rot}°")
         # Primary
-        b64 = self._render_page_b64(page, self.primary_dpi)
+        b64 = self._render_page_b64(page, self.primary_dpi,
+                                    extra_rotation=content_rot)
         primary_user = (
             "Extract the current revision (or issue) value from the engineering "
             "drawing shown. Follow every rule in the system instructions. "
@@ -1764,7 +2054,8 @@ class AzureVisionExtractor:
                 "a JSON object with keys rev_value, region, confidence, "
                 "evidence. rev_value must be empty string or one of: A-Z "
                 "(but never `O` or `I` — those are diameter symbol / centreline), "
-                "0-99, 0N (leading zero), or N-M (hyphenated, both 0-99). "
+                "0-99, 0N (leading zero), N-M (hyphenated, both 0-99), or "
+                "NA (digit + letter suffix like 2A, 2B). "
                 "Do not invent values; if uncertain, return empty string with "
                 "confidence=low."
             )
@@ -1778,6 +2069,59 @@ class AzureVisionExtractor:
                     trace.append(f"retry: {data}")
             else:
                 trace.append(f"retry: unparseable JSON: {raw[:160]}")
+
+        # For scans where content rotation wasn't detected (e.g. the page is
+        # a single raster image), try the three other 90° rotations and keep
+        # the most confident response. We treat pages with very few native
+        # tokens (< 30) as effectively scans — a drawing with just a footer
+        # page number but rasterised body is still a scan for our purposes.
+        # We only probe when:
+        #   - We didn't already detect a rotation, AND
+        #   - The page is effectively a scan, AND
+        #   - The current response is missing or low-confidence.
+        try:
+            native_token_count = len(page.get_text("words"))
+        except Exception:  # noqa: BLE001
+            native_token_count = 0
+        page_is_effectively_scan = native_token_count < 30
+        needs_rotation_probe = (
+            content_rot == 0
+            and page_is_effectively_scan
+            and (data is None or data.get("confidence") != "high"
+                 or not data.get("rev_value"))
+        )
+        if needs_rotation_probe:
+            trace.append("scan with uncertain primary — probing rotations")
+            conf_rank = {"high": 3, "medium": 2, "low": 1, None: 0}
+            best_conf = conf_rank.get(
+                data.get("confidence") if data else None, 0
+            )
+            best_data = data
+            for probe_rot in (90, 180, 270):
+                probe_b64 = self._render_page_b64(
+                    page, self.primary_dpi, extra_rotation=probe_rot
+                )
+                probe_user = (
+                    f"This is the same drawing rotated {probe_rot}° clockwise. "
+                    f"Read it in this orientation and return the JSON. "
+                    f"If this orientation is correct (text reads upright), "
+                    f"return `high` confidence. Otherwise return `low`."
+                )
+                probe_data, probe_raw = self._call_gpt([probe_b64], probe_user)
+                if probe_data:
+                    ok, _ = _validate_gpt_payload(probe_data)
+                    if ok:
+                        probe_conf = conf_rank.get(
+                            probe_data.get("confidence"), 0
+                        )
+                        trace.append(f"probe {probe_rot}°: {probe_data}")
+                        if probe_conf > best_conf and probe_data.get("rev_value"):
+                            best_conf = probe_conf
+                            best_data = probe_data
+                # Short-circuit: if any probe returns high, accept it.
+                if best_conf >= 3:
+                    break
+            data = best_data
 
         # Region zoom for non-high-confidence cases.
         if (data is not None
@@ -2106,6 +2450,7 @@ def run_pipeline(
     enable_ocr: bool = False,
     max_workers: int = DEFAULT_MAX_WORKERS,
     write_trace: bool = False,
+    excel_text_prefix: bool = True,
 ) -> List[Dict[str, Any]]:
     """Run extraction over every PDF in ``input_folder`` and write a CSV.
 
@@ -2127,6 +2472,12 @@ def run_pipeline(
         Threads for parallel processing.
     write_trace
         Include per-file extraction trace in the CSV.
+    excel_text_prefix
+        When True (default), prepend an apostrophe (``'``) to each non-empty
+        revision value in the CSV. This forces Excel to render values like
+        ``1-0``, ``0-3``, ``01`` as text instead of dates or stripped numbers.
+        Strip the apostrophe with a quick `=MID(A2,2,LEN(A2)-1)` formula or a
+        Find-and-Replace pass when downstream processing needs the raw value.
 
     Returns
     -------
@@ -2191,6 +2542,16 @@ def run_pipeline(
             else:
                 row["trace"] = " | ".join(r.trace)
             row["needs_review"] = "yes" if r.needs_review else "no"
+            # Prefix non-empty revision values with an apostrophe so Excel
+            # renders them as text. Without this, Excel turns "1-0" into
+            # "01-Jan", "0-3" into "00-Mar", and strips leading zeros from
+            # "01"/"02"/etc. The apostrophe is a standard Excel text-cell
+            # escape: it isn't displayed in the cell, but it is present in
+            # the raw CSV value. Strip with a single Find-and-Replace
+            # (find: `'`, replace with empty) when preparing data for
+            # downstream systems.
+            if excel_text_prefix and row.get("value"):
+                row["value"] = "'" + row["value"]
             w.writerow(row)
 
     # Summary
@@ -2252,6 +2613,13 @@ def _parse_args(argv=None):
                    help=f"Thread count (default: {DEFAULT_MAX_WORKERS}).")
     p.add_argument("--trace", action="store_true",
                    help="Include per-file extraction trace in the CSV.")
+    p.add_argument("--no-excel-prefix", action="store_true",
+                   help="Disable the apostrophe prefix on revision values. "
+                        "By default the value column is written as text-typed "
+                        "Excel cells (apostrophe prefix) so values like "
+                        "'1-0' don't become '01-Jan' when opened in Excel. "
+                        "Use this flag for downstream systems that expect "
+                        "raw values.")
     return p.parse_args(argv)
 
 
@@ -2270,6 +2638,7 @@ def main(argv=None):
         enable_ocr=args.enable_ocr,
         max_workers=args.max_workers,
         write_trace=args.trace,
+        excel_text_prefix=not args.no_excel_prefix,
     )
     LOG.info(f"Done in {time.time() - t0:.1f}s")
 

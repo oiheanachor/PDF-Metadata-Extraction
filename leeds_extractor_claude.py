@@ -578,10 +578,26 @@ def _is_template_stamp(
     templates place in an absolute page corner (typically bottom-left).
 
     Such stamps are noise — they describe the *template* version, not the
-    drawing's revision. They sit very near a page corner (often rendered
-    vertically along the page edge, like ``Rev 1`` written sideways at the
-    bottom-left). The give-aways are:
+    drawing's revision. They are drawn rotated 90° along the page edge,
+    so the text reads vertically (e.g. ``Rev`` written sideways from
+    bottom-up at the bottom-left).
 
+    We detect them via TWO independent signals — either suffices.
+
+    Signal A — sideways-rendered text in a page corner (the strongest):
+      The marker's word bbox is TALLER than WIDE (``w/h < 1``). Normal
+      horizontal text always has ``w/h > 1`` (a 3-letter word like
+      ``Rev`` rendered horizontally is ~17 px wide × 10 px tall, ratio
+      ~1.7; ``Iss.`` is ~13 × 10, ratio ~1.3). A sideways-rendered
+      ``Rev`` has bbox ~8.5 × 12 — ratio < 1 because the rotated glyphs
+      occupy a tall, narrow strip. This signal works regardless of
+      whether ``page.rotation`` is set, because the page-level rotation
+      is already applied to bbox dimensions by ``_extract_tokens``. We
+      additionally require the marker to be in a page corner (``x``
+      within ~70 px of an edge AND ``y`` within ~70 px of an edge) to
+      avoid catching dimension labels in the middle of the drawing.
+
+    Signal B — corner + more-inset sibling (original behaviour):
       * the marker's centre sits within ~45 px of two adjacent page edges
         (we allow this wide a margin because vertically-rendered stamps
         report ``w``/``h`` from their original drawing orientation, so the
@@ -597,6 +613,23 @@ def _is_template_stamp(
         A real template stamp is in a different cell from its sibling, not
         side-by-side on the same row.
     """
+    # ---- Signal A: sideways-rendered text in a page corner ----------
+    # A marker whose bbox is taller than wide can only happen when the
+    # text was drawn rotated 90° or 270°. Combined with corner placement
+    # this is a near-definitive template-stamp signal.
+    sideways_corner_margin = 70.0
+    in_corner_loose = (
+        (marker.x <= sideways_corner_margin
+         or marker.x >= page_w - sideways_corner_margin)
+        and (marker.y <= sideways_corner_margin
+             or marker.y >= page_h - sideways_corner_margin)
+    )
+    # marker.h must be meaningful; if h is tiny (~0), the ratio test is
+    # noise-prone. A genuine horizontal "Rev"/"Iss." is at least ~6 px high.
+    if in_corner_loose and marker.h > 4.0 and marker.w / marker.h < 1.0:
+        return True
+
+    # ---- Signal B: corner + more-inset sibling ----------------------
     corner_margin = 45.0
     near_left = marker.x <= corner_margin
     near_right = marker.x >= page_w - corner_margin
@@ -2780,11 +2813,30 @@ def run_pipeline(
     # Construct GPT client once if needed.
     gpt: Optional[AzureVisionExtractor] = None
     if mode in ("gpt_only", "pymupdf_with_gpt_fallback"):
-        if not (_AZURE_AVAILABLE and azure_endpoint and azure_key):
+        # Report each missing prerequisite specifically — saves the user
+        # from probing each one manually when something is misconfigured.
+        problems: List[str] = []
+        if not _AZURE_AVAILABLE:
+            problems.append(
+                "the `openai` package is not installed in this Python "
+                "environment (run `pip install openai`)"
+            )
+        if not azure_endpoint:
+            problems.append(
+                "no Azure endpoint provided (set AZURE_OPENAI_ENDPOINT "
+                "or pass --azure-endpoint)"
+            )
+        if not azure_key:
+            problems.append(
+                "no Azure API key provided (set AZURE_OPENAI_KEY or "
+                "pass --azure-key)"
+            )
+        if problems:
             raise RuntimeError(
-                f"mode={mode!r} requires Azure credentials and the openai "
-                f"package. Pass --azure-endpoint and --azure-key, or use "
-                f"--mode pymupdf_only."
+                f"mode={mode!r} cannot run because: "
+                + "; ".join(problems)
+                + ". Alternatively, use --mode pymupdf_only to skip the "
+                "GPT pipeline entirely."
             )
         gpt = AzureVisionExtractor(
             azure_endpoint, azure_key,

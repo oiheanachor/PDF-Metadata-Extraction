@@ -934,8 +934,42 @@ def _pick_latest_in_revision_table(
         above_header.append(c)
     if not above_header:
         return None
-    # Latest = top-most. Tie-break by column closeness.
-    best = min(above_header, key=lambda t: (t.y, abs(t.x - marker.x)))
+    # Walk bottom-to-top, enforcing row-cadence continuity. The BL revtable
+    # rows are tightly stacked (~14 px apart on this site). If there is a
+    # large gap before the next candidate as we walk up, anything beyond
+    # that gap is almost certainly in a *different* table (parts list,
+    # gear-data table, notes section, etc.) sitting above the revtable,
+    # NOT a continuation of the revision history. The cadence break stops
+    # us from reaching into those false neighbours.
+    above_header.sort(key=lambda t: -t.y)  # bottom-to-top
+    # Typical row spacing: header-to-first-data row gives us a baseline.
+    # We use the SMALLEST gap observed (not median) because if the marker
+    # has two stacked tables above it (e.g. a 1-row revtable + a 3-row
+    # parts list further up), the parts list has tight cadence and the
+    # gap BETWEEN tables is large — taking the smallest gap gives us the
+    # genuine row spacing of whichever table the bottom-most candidate
+    # actually belongs to.
+    first_gap = marker.y - above_header[0].y
+    all_gaps = [first_gap]
+    for i in range(len(above_header) - 1):
+        all_gaps.append(above_header[i].y - above_header[i + 1].y)
+    typical_row = min(all_gaps)
+    # Floor: typical can't be smaller than ~1.3× the marker height
+    # (otherwise OCR jitter on a single tight pair could give us an
+    # artificially small "typical").
+    typical_row = max(typical_row, max(marker.h, 6.0) * 1.3)
+    # Allow up to 2.0× typical spacing before declaring cadence break.
+    # This handles double-height "wrapped change-description" rows while
+    # rejecting jumps to a completely different table.
+    max_gap = typical_row * 2.0
+    accepted = [above_header[0]]
+    for c in above_header[1:]:
+        prev_y = accepted[-1].y
+        if prev_y - c.y > max_gap:
+            break  # cadence broken — beyond is a different table/section
+        accepted.append(c)
+    # Latest = top-most among accepted. Tie-break by column closeness.
+    best = min(accepted, key=lambda t: (t.y, abs(t.x - marker.x)))
     return best, "above-header"
 
 
@@ -1664,7 +1698,7 @@ There are three regions to consider, in priority order:
 
 - **Title block (bottom-right):** the value sits inside the SAME small cell as the `Rev` / `Iss.` label, **directly below** the label. Pick the value-shaped token *immediately* under the label (typically 5–15 px below). Do NOT pick a token sitting two rows or more below — that token is in a different cell (most commonly the `Sheet 1 of 2` row, where the trailing `2` is the sheet count, NOT the revision). If multiple values are visibly stacked inside the same cell (e.g. an `A` on one line with a `1` right under it within the cell border), the **bottom-most** of that stack is the latest.
 - **Bottom-left revision history table:** the header sits at the bottom of the table; data grows upward; the **top-most** data row (visually highest above the header) is the current value. Only consider tokens that are clearly inside the leftmost column of the table — do NOT pull letters from material specs, notes, or title-block text that happen to sit above the table.
-- **Top-left ISSUE/ALTERATIONS table:** the header sits at the top; data grows downward; the **bottom-most** value in the ISSUE column is the current value. The table has a clear border or visible row separators; do NOT include values from outside the table (e.g. dimension annotations, hole counts, or part-reference table rows that happen to share a similar column position).
+- **Top-left ISSUE/ALTERATIONS table:** the header sits at the top; data grows downward; the **bottom-most** value in the ISSUE column is the current value. The table has a clear border or visible row separators; do NOT include values from outside the table (e.g. dimension annotations, hole counts, or part-reference table rows that happen to share a similar column position). **The ISSUE column on this site is often NON-SEQUENTIAL** — it may jump from `A` directly to `8`, `9`, `10`, or `11` because intermediate revisions (1, 2, ..., 7) were on earlier paper drawings that pre-date the AutoCAD redraw. **The bottom-most row is ALWAYS the latest, regardless of whether the numbering is consecutive.** Do not return `A` (the ORIGINAL ISSUE row) just because the table has a gap or the numbers seem out of order — return the bottom-most value.
 
 # Conflict resolution (very important)
 
@@ -1755,6 +1789,18 @@ Example G — Sheet-N false-friend in title block:
   - Bottom-right title block cell: `Rev` label with `1-0` directly below it (a few pixels under the label)
   - One cell-row further down: `Sheet 1 of 2` (so a stray `1` and `2` appear below the revision cell)
   - Correct answer: rev_value=1-0, region=br_title. The `2` further down is the sheet count, NOT a revision. The value must come from the cell DIRECTLY below the `Rev` label, not the row below that.
+
+Example H — classic Exeeco ISSUE table with non-sequential numbering (CRITICAL):
+  - Top-left table: header `ISSUE | ALTERATIONS`; rows reading top-to-bottom:
+      A   | ORIGINAL ISSUE
+      8   | REDRAWN ON AUTOCAD ITCAD 8.4.92
+      9   | CN911 B.T. 5.2.95
+      10  | CN1021 B.T. 16.7.86
+  - Correct answer: rev_value=10, region=tl_issue (bottom-most). It is NORMAL on this site for the ISSUE column to JUMP from `A` directly to a large number like `8`, `9`, `10`, or `11` — the intermediate revisions (1, 2, ..., 7) existed on earlier paper-drawn versions of the drawing and were not transcribed when the drawing was redrawn on AutoCAD. Do NOT return `A` just because the table has a gap. The bottom-most row is ALWAYS the latest, regardless of whether the numbering is consecutive.
+
+Example I — classic Exeeco ISSUE table with only `A` and one number row:
+  - Top-left table: rows `A`, `4` reading top-to-bottom
+  - Correct answer: rev_value=4. Same rule — bottom-most is latest. Even a 2-row table with a big numeric jump is valid; the answer is the bottom number, not the letter at the top.
 """
 
 
@@ -1861,6 +1907,101 @@ class AzureVisionExtractor:
             pix = page.get_pixmap(dpi=dpi)
         return base64.b64encode(pix.tobytes("png")).decode("ascii")
 
+    def _render_multiview_packet(
+        self,
+        page: fitz.Page,
+        extra_rotation: int = 0,
+    ) -> List[Tuple[str, str]]:
+        """Render a packet of labelled views for a single GPT call.
+
+        Why a multi-view packet beats a single full-page render:
+          - GPT-4 Vision struggles with small text on full-page drawings: a
+            revision cell may be 8 pt text on an A3 page that gets resized to
+            fit the model's input budget. By the time the model sees it, the
+            cell content is often <10 px tall and reads as a noisy blob.
+          - Sending pre-rendered HIGH-DPI crops of every candidate region
+            (TL, BL, BR, TR) ensures every potential revision location is
+            legible. The model still gets one low-DPI full-page view as
+            orientation context.
+          - All views go in ONE call, so cost is similar to a single
+            high-DPI full-page render but accuracy is much higher.
+
+        Crops are sized to the *visual* page rectangle (PyMuPDF's
+        ``page.rect`` already accounts for ``page.rotation``). The optional
+        ``extra_rotation`` is applied via the transformation matrix and
+        affects only the full-page context view (the region crops are
+        defined in visual coordinates that match the rotated render).
+        """
+        import base64
+        out: List[Tuple[str, str]] = []
+
+        # --- full-page context (low DPI, orientation cue) ---
+        if extra_rotation:
+            zoom = 110 / 72.0
+            mat = fitz.Matrix(zoom, zoom).prerotate(extra_rotation)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+        else:
+            pix = page.get_pixmap(dpi=110)
+        out.append((
+            "full_page_context",
+            base64.b64encode(pix.tobytes("png")).decode("ascii"),
+        ))
+
+        # --- four region crops at high DPI ---
+        # If extra_rotation is non-zero, render the rotated full page first
+        # at high DPI then crop in image space — keeps the crops in the
+        # rotated orientation. Otherwise crop in PDF space (cheaper).
+        if extra_rotation:
+            zoom = 220 / 72.0
+            mat = fitz.Matrix(zoom, zoom).prerotate(extra_rotation)
+            pix_hi = page.get_pixmap(matrix=mat, alpha=False)
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(pix_hi.tobytes("png")))
+            w, h = img.size
+            crops = [
+                ("top_left_issue_or_title_block",
+                 img.crop((0, 0, int(w * 0.45), int(h * 0.35)))),
+                ("bottom_left_revision_table",
+                 img.crop((0, int(h * 0.55), int(w * 0.50), h))),
+                ("bottom_right_title_block",
+                 img.crop((int(w * 0.55), int(h * 0.55), w, h))),
+                ("top_right_title_or_revision_block",
+                 img.crop((int(w * 0.55), 0, w, int(h * 0.35)))),
+            ]
+            for label, crop_img in crops:
+                buf = io.BytesIO()
+                crop_img.save(buf, format="PNG")
+                out.append((label, base64.b64encode(buf.getvalue()).decode("ascii")))
+        else:
+            rect = page.rect
+            zoom = 220 / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            region_specs = [
+                ("top_left_issue_or_title_block",
+                 fitz.Rect(rect.x0, rect.y0,
+                           rect.x0 + rect.width * 0.45,
+                           rect.y0 + rect.height * 0.35)),
+                ("bottom_left_revision_table",
+                 fitz.Rect(rect.x0,
+                           rect.y0 + rect.height * 0.55,
+                           rect.x0 + rect.width * 0.50,
+                           rect.y1)),
+                ("bottom_right_title_block",
+                 fitz.Rect(rect.x0 + rect.width * 0.55,
+                           rect.y0 + rect.height * 0.55,
+                           rect.x1, rect.y1)),
+                ("top_right_title_or_revision_block",
+                 fitz.Rect(rect.x0 + rect.width * 0.55,
+                           rect.y0,
+                           rect.x1,
+                           rect.y0 + rect.height * 0.35)),
+            ]
+            for label, clip in region_specs:
+                pix = page.get_pixmap(matrix=mat, alpha=False, clip=clip)
+                out.append((label, base64.b64encode(pix.tobytes("png")).decode("ascii")))
+        return out
+
     @staticmethod
     def _detect_content_rotation(page: fitz.Page) -> int:
         """Best-effort detection of content rotation for drawings whose page
@@ -1958,19 +2099,30 @@ class AzureVisionExtractor:
 
     def _call_gpt(
         self,
-        b64_images: Sequence[str],
+        b64_images: Sequence[Any],
         user_text: str,
         *,
         max_tokens: int = 400,
     ) -> Tuple[Optional[Dict[str, Any]], str]:
         """Make one GPT call with one or more images attached.
 
+        ``b64_images`` accepts either:
+          - ``List[str]`` — bare base64 strings (single view or list of views)
+          - ``List[Tuple[str, str]]`` — ``(label, base64)`` pairs; an
+            ``"Image: <label>"`` text frame is inserted before each image so
+            the model can refer to views by their semantic name.
+
         Returns ``(parsed_dict_or_None, raw_text)``. Forces JSON object output
         when the deployment supports it; falls back to free-form on the rare
         deployment that doesn't.
         """
         content: List[Dict[str, Any]] = [{"type": "text", "text": user_text}]
-        for b64 in b64_images:
+        for item in b64_images:
+            if isinstance(item, tuple) and len(item) == 2:
+                label, b64 = item
+                content.append({"type": "text", "text": f"Image: {label}"})
+            else:
+                b64 = item
             content.append({
                 "type": "image_url",
                 "image_url": {
@@ -2027,15 +2179,26 @@ class AzureVisionExtractor:
         content_rot = self._detect_content_rotation(page)
         if content_rot:
             trace.append(f"detected content rotation: {content_rot}°")
-        # Primary
-        b64 = self._render_page_b64(page, self.primary_dpi,
-                                    extra_rotation=content_rot)
+        # Primary: render a multi-view packet (full page + 4 region crops).
+        # This puts every potential revision location at high DPI in one
+        # call, which is the single biggest reliability lever we have for
+        # GPT — full-page-only renders compress small revision-cell text
+        # down to ~10 px and the model misreads it as letters.
+        packet = self._render_multiview_packet(page, extra_rotation=content_rot)
         primary_user = (
-            "Extract the current revision (or issue) value from the engineering "
-            "drawing shown. Follow every rule in the system instructions. "
-            "Return ONLY the JSON object."
+            "Extract the current REV / ISSUE value from this engineering "
+            "drawing. You are given:\n"
+            "  - One full-page context image (for orientation and layout).\n"
+            "  - Four targeted high-DPI crops covering the four corners where "
+            "the title block, issue table, and revision history typically "
+            "sit on this site's templates (top-left, top-right, bottom-left, "
+            "bottom-right).\n"
+            "Inspect EVERY image before answering. Prefer visual evidence "
+            "from the high-DPI region crops over the full-page view when "
+            "they conflict (the crops are clearer). Follow every rule in "
+            "the system instructions. Return ONLY the JSON object."
         )
-        data, raw = self._call_gpt([b64], primary_user)
+        data, raw = self._call_gpt(packet, primary_user)
         if not data:
             trace.append(f"primary: unparseable JSON: {raw[:160]}")
         else:
@@ -2050,8 +2213,8 @@ class AzureVisionExtractor:
         if data is None and self.max_retries > 0:
             retry_user = (
                 "Your previous response did not conform to the required JSON "
-                "schema or was unreadable. Re-read the drawing and return ONLY "
-                "a JSON object with keys rev_value, region, confidence, "
+                "schema or was unreadable. Re-read the drawing crops and return "
+                "ONLY a JSON object with keys rev_value, region, confidence, "
                 "evidence. rev_value must be empty string or one of: A-Z "
                 "(but never `O` or `I` — those are diameter symbol / centreline), "
                 "0-99, 0N (leading zero), N-M (hyphenated, both 0-99), or "
@@ -2059,7 +2222,7 @@ class AzureVisionExtractor:
                 "Do not invent values; if uncertain, return empty string with "
                 "confidence=low."
             )
-            data, raw = self._call_gpt([b64], retry_user)
+            data, raw = self._call_gpt(packet, retry_user)
             if data:
                 ok, why = _validate_gpt_payload(data)
                 if not ok:
@@ -2098,16 +2261,19 @@ class AzureVisionExtractor:
             )
             best_data = data
             for probe_rot in (90, 180, 270):
-                probe_b64 = self._render_page_b64(
-                    page, self.primary_dpi, extra_rotation=probe_rot
+                probe_packet = self._render_multiview_packet(
+                    page, extra_rotation=probe_rot,
                 )
                 probe_user = (
                     f"This is the same drawing rotated {probe_rot}° clockwise. "
-                    f"Read it in this orientation and return the JSON. "
-                    f"If this orientation is correct (text reads upright), "
-                    f"return `high` confidence. Otherwise return `low`."
+                    f"You are given the rotated full-page view plus four "
+                    f"high-DPI corner crops at this rotation. Read the "
+                    f"drawing in this orientation and return the JSON. "
+                    f"If this orientation is correct (text reads upright "
+                    f"in the crops), return `high` confidence. Otherwise "
+                    f"return `low`."
                 )
-                probe_data, probe_raw = self._call_gpt([probe_b64], probe_user)
+                probe_data, probe_raw = self._call_gpt(probe_packet, probe_user)
                 if probe_data:
                     ok, _ = _validate_gpt_payload(probe_data)
                     if ok:
@@ -2291,14 +2457,24 @@ def extract_rev(
         raise ValueError(f"mode={mode!r} requires gpt_extractor")
 
     trace: List[str] = [f"file={pdf_path.name} mode={mode}"]
+    # Detect rotation once up-front. Rotated PDFs always get flagged for
+    # human review per the user's requirement, regardless of confidence.
+    rotated, rotated_reason = _detect_pdf_rotation_state(pdf_path)
+    if rotated:
+        trace.append(f"rotation flag: {rotated_reason}")
+
+    def _result(cand, *, page, engine):
+        return _candidate_to_result(
+            cand, pdf_path, page=page, engine=engine, trace=trace,
+            rotated=rotated, rotated_reason=rotated_reason,
+        )
+
     try:
         # ----- Mode: gpt_only --------------------------------------------
         if mode == "gpt_only":
             cand, gpt_trace, page_no = gpt_extractor.extract(pdf_path)
             trace.extend(gpt_trace)
-            return _candidate_to_result(
-                cand, pdf_path, page=page_no, engine="gpt_vision", trace=trace,
-            )
+            return _result(cand, page=page_no, engine="gpt_vision")
 
         # ----- Native pass (mode = pymupdf_only or pymupdf_with_gpt_fallback)
         native_best: Optional[Candidate] = None
@@ -2332,39 +2508,23 @@ def extract_rev(
 
         # ----- Mode: pymupdf_only ----------------------------------------
         if mode == "pymupdf_only":
-            return _candidate_to_result(
-                native_best, pdf_path, page=native_page, engine="native",
-                trace=trace,
-            )
+            return _result(native_best, page=native_page, engine="native")
 
         # ----- Mode: pymupdf_with_gpt_fallback ---------------------------
         # Use GPT when native produced no value, low-confidence value, or
         # came back blank.
         if native_best is not None and not _below_threshold(native_best) \
                 and native_best.value:
-            return _candidate_to_result(
-                native_best, pdf_path, page=native_page, engine="native",
-                trace=trace,
-            )
+            return _result(native_best, page=native_page, engine="native")
         trace.append("native unsatisfactory — invoking GPT fallback")
         gpt_cand, gpt_trace, page_no = gpt_extractor.extract(pdf_path)
         trace.extend(gpt_trace)
-        # If native had something but lower confidence than GPT, prefer GPT
-        # only when GPT is at least medium confidence. Otherwise return
-        # whichever has a value.
+        # If GPT didn't produce a value but native did, fall back to native.
         if gpt_cand is None or not gpt_cand.value:
             if native_best is not None and native_best.value:
-                return _candidate_to_result(
-                    native_best, pdf_path, page=native_page, engine="native",
-                    trace=trace,
-                )
-            return _candidate_to_result(
-                gpt_cand, pdf_path, page=page_no, engine="gpt_vision",
-                trace=trace,
-            )
-        return _candidate_to_result(
-            gpt_cand, pdf_path, page=page_no, engine="gpt_vision", trace=trace,
-        )
+                return _result(native_best, page=native_page, engine="native")
+            return _result(gpt_cand, page=page_no, engine="gpt_vision")
+        return _result(gpt_cand, page=page_no, engine="gpt_vision")
 
     except Exception as e:  # noqa: BLE001
         return RevResult(
@@ -2373,9 +2533,106 @@ def extract_rev(
             engine="error",
             confidence="none",
             needs_review=True,
-            review_reason=f"error: {e}",
+            review_reason=(
+                f"error: {e}"
+                + (f"; rotated: {rotated_reason}" if rotated else "")
+            ),
             trace=trace + [f"exception: {e}"],
         )
+
+
+def _detect_pdf_rotation_state(pdf_path: Path) -> Tuple[bool, str]:
+    """Return ``(is_rotated, reason)`` for a PDF.
+
+    The semantic we care about: **would a human reviewer need to rotate
+    their head (or the page) to read this drawing?** This is a property of
+    the *rendered* output, not the PDF metadata.
+
+    Key insight: ``page.rotation`` is a *compensation flag* in PDF, not a
+    rotation of the visual output. A page with mediabox 842×1191 (portrait)
+    and ``rotation=90`` renders as 1191×842 (landscape) WITH TEXT UPRIGHT.
+    PyMuPDF's ``page.rect`` and ``get_pixmap()`` already apply the rotation,
+    so the rendered image is visually correct.
+
+    The correct test is: **after applying ``page.rotation``, does the
+    dominant text direction read upright?** PyMuPDF reports text ``dir``
+    in mediabox space; we compose it with ``page.rotation`` to get the
+    visual direction. Visually-upright means ``visual_dir ≈ (1, 0)``.
+
+    Cases:
+      * Pages with native text where the composed visual direction IS
+        upright (≥60% of lines) → NOT rotated.
+      * Pages with native text where the composed visual direction IS
+        NOT upright → rotated (this is the genuine "drawn sideways"
+        pathology).
+      * Pages with NO native text (pure scans) → we cannot determine
+        visual orientation from PDF metadata alone. Flag as "unknown
+        orientation" so a reviewer confirms. This is conservative but
+        correct: scans like 8C462 and 8C463 have ``page.rotation=0`` AND
+        zero native tokens AND render sideways, so the only honest
+        signal we can return is "we don't know".
+    """
+    import math
+    try:
+        with fitz.open(pdf_path) as doc:
+            for page in doc:
+                rotation = page.rotation or 0
+                try:
+                    txt = page.get_text("dict")
+                except Exception:  # noqa: BLE001
+                    txt = {"blocks": []}
+                # Count mediabox text directions.
+                rot_counts = {0: 0, 90: 0, 180: 0, 270: 0}
+                for block in txt.get("blocks", []):
+                    for line in block.get("lines", []):
+                        dx, dy = line.get("dir", (1.0, 0.0))
+                        if abs(dx) > abs(dy):
+                            rot = 0 if dx > 0 else 180
+                        else:
+                            rot = 270 if dy > 0 else 90
+                        rot_counts[rot] += 1
+                total = sum(rot_counts.values())
+                if total == 0:
+                    # No native text on this page — can't determine visual
+                    # orientation from PDF metadata. Flag as unknown so a
+                    # reviewer can confirm. This is the correct conservative
+                    # answer for pure scans.
+                    return True, "scan (orientation unverified)"
+                # Compose mediabox dominant direction with page.rotation
+                # to get the visual direction. PDF rotation in y-down PDF
+                # coordinates is mathematically CCW:
+                #   visual_x = mx*cos(R) - my*sin(R)
+                #   visual_y = mx*sin(R) + my*cos(R)
+                # Verified empirically: a mediabox dir (0, -1) on a
+                # rotation=90 page renders visually as (1, 0) — upright.
+                rad = math.radians(rotation)
+                cos_r, sin_r = math.cos(rad), math.sin(rad)
+                vis_counts = {0: 0, 90: 0, 180: 0, 270: 0}
+                for mb_rot, count in rot_counts.items():
+                    if count == 0:
+                        continue
+                    # Convert mb_rot to a unit vector.
+                    if mb_rot == 0:    mx, my = 1, 0
+                    elif mb_rot == 90: mx, my = 0, -1
+                    elif mb_rot == 180:mx, my = -1, 0
+                    else:              mx, my = 0, 1
+                    vx = mx * cos_r - my * sin_r
+                    vy = mx * sin_r + my * cos_r
+                    # Classify visual vector to nearest cardinal.
+                    if abs(vx) > abs(vy):
+                        v_rot = 0 if vx > 0 else 180
+                    else:
+                        v_rot = 270 if vy > 0 else 90
+                    vis_counts[v_rot] += count
+                dominant = max(vis_counts, key=lambda k: vis_counts[k])
+                # Visually upright = (1, 0) which is our 0° bucket.
+                # If <60% of lines read upright in the visual frame,
+                # this page is genuinely sideways.
+                if dominant != 0 and vis_counts[dominant] / total >= 0.6:
+                    return True, f"content drawn rotated ({dominant}° in visual frame)"
+    except Exception:  # noqa: BLE001
+        pass
+    return False, ""
 
 
 def _candidate_to_result(
@@ -2385,7 +2642,21 @@ def _candidate_to_result(
     page: int,
     engine: str,
     trace: List[str],
+    rotated: bool = False,
+    rotated_reason: str = "",
 ) -> RevResult:
+    """Build the final RevResult.
+
+    Setting ``rotated=True`` forces ``needs_review`` regardless of
+    confidence — per the user's request that rotated drawings always get
+    a second-look human review as an extra validation layer. Rotated
+    content is a known source of subtle GPT misreads on this site (small
+    text in narrow corner cells does not survive aggressive image
+    resizing once the model has to mentally rotate the view).
+    """
+    def _join_reasons(*parts: str) -> str:
+        return "; ".join(p for p in parts if p)
+
     if cand is None:
         return RevResult(
             file=pdf_path.name,
@@ -2395,10 +2666,24 @@ def _candidate_to_result(
             confidence="none",
             region="",
             needs_review=True,
-            review_reason="no_extraction",
+            review_reason=_join_reasons(
+                "no_extraction",
+                f"rotated: {rotated_reason}" if rotated else "",
+            ),
             trace=trace,
         )
     conf = _confidence_label(cand)
+    # Order matters: 'blank' is the more specific signal — when a candidate
+    # has both a blank value AND low confidence (which happens together by
+    # construction since blank values get low scores), reporting 'blank' is
+    # more actionable for the reviewer than 'low_confidence' on its own.
+    if cand.value == "":
+        primary_reason = "blank"
+    elif conf == "low":
+        primary_reason = "low_confidence"
+    else:
+        primary_reason = ""
+    rotation_reason = f"rotated: {rotated_reason}" if rotated else ""
     return RevResult(
         file=pdf_path.name,
         page=page,
@@ -2406,9 +2691,11 @@ def _candidate_to_result(
         engine=engine,
         confidence=conf,
         region=cand.region,
-        needs_review=(conf == "low" or cand.value == ""),
-        review_reason=("low_confidence" if conf == "low"
-                       else ("blank" if cand.value == "" else "")),
+        # needs_review fires when ANY of: low confidence, blank value, or
+        # rotated source PDF. Rotation alone is enough — even a high-conf
+        # value from a rotated drawing should get the second-look layer.
+        needs_review=(conf == "low" or cand.value == "" or rotated),
+        review_reason=_join_reasons(primary_reason, rotation_reason),
         trace=trace,
     )
 
